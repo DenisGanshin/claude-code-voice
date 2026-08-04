@@ -1,0 +1,53 @@
+{
+  "input_device_preferences": [
+    "Headset",
+    "Headphones",
+    "Microphone Array",
+    "Internal Microphone"
+  ],
+  "hotkey": "caps lock",
+  "cancel_hotkey": "alt+x",
+  "quit_hotkey": "ctrl+alt+q",
+  "show_overlay": true,
+  "keep_recordings": true,
+  "recordings_dir": "_recordings",
+  "recordings_ttl_hours": 24,
+  "language": "ru",
+  "stt_model": "whisper-large-v3-turbo",
+  "normalize": true,
+  "normalize_model": "llama-3.3-70b-versatile",
+  "normalize_fallback_model": "llama-3.1-8b-instant",
+  "silence_stop_sec": 2.5,
+  "wait_for_speech_sec": 15,
+  "max_record_sec": 600,
+  "auto_max_record_sec": 90,
+  "warmup_ms": 800,
+  "preroll_ms": 400,
+  "vad_factor": 3.5,
+  "vad_floor": 0.004,
+  "vad_release": 0.55,
+  "vad_speech_cap": 0.35,
+  "speech_onset_blocks": 2,
+  "noise_window_sec": 4.0,
+  "noise_percentile": 15,
+  "noise_rise_rate": 0.05,
+  "auto_paste": true,
+  "save_audio": false,
+  "beep": true,
+  "tts_chain": [
+    "eleven",
+    "piper",
+    "edge",
+    "sapi"
+  ],
+  "tts_premium_max_chars": 500,
+  "eleven_voice": "eric",
+  "eleven_model": "quality",
+  "eleven_settings": {
+    "stability": 0.3,
+    "similarity_boost": 0.75,
+    "style": 0.15
+  },
+  "piper_voice": "irina",
+  "tts_max_chars": 700
+}
