@@ -1,0 +1,1323 @@
+# -*- coding: utf-8 -*-
+"""
+Ядро голосового ввода: микрофон -> WAV -> Groq Whisper -> нормализация -> текст.
+
+Используется двумя обёртками:
+  * voice_once.py   — одна диктовка (слэш-команда /voice)
+  * voice_hotkey.py — резидентный демон с глобальным хоткеем
+
+Принципы:
+  * ключи читаются из keys_file() и НИКОГДА не печатаются (CLAUDE.md §2);
+  * весь диагностический вывод идёт в stderr, чистый транскрипт — в stdout;
+  * звуковая индикация (beep) обязательна: пользователь не видит консоль во время записи.
+"""
+
+import io
+import json
+import os
+import re
+import sys
+import threading
+import time
+import wave
+from collections import deque
+from pathlib import Path
+
+import numpy as np
+import requests
+import sounddevice as sd
+
+# Консоль Windows по умолчанию отдаёт cp1251/cp866: любой символ вне неё (стрелка,
+# тире, эмодзи) роняет print целиком с UnicodeEncodeError. Проект пишет по-русски и
+# в stdout отдаёт транскрипт, поэтому кодировку фиксируем сразу при импорте ядра.
+# stdin — обязательно вместе с ними: текст, пришедший в UTF-8, иначе прочитается
+# как cp1251 и превратится в «Р“РѕР»РѕСЃ», а голос честно озвучит эту бессмыслицу.
+for _stream in (sys.stdin, sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):  # поток подменён (pytest, пайп) — не критично
+        pass
+
+BASE_DIR = Path(__file__).resolve().parent
+
+
+def keys_file():
+    """
+    Где лежит файл с ключами. Порядок поиска — от явного к обычному.
+
+    1. `VOICE_KEYS_FILE` — переменная окружения, полный путь. Последнее слово.
+    2. `.env` рядом со скриптами — то, что ожидает увидеть человек, поставивший
+       проект из репозитория.
+    3. `keys.local` на два уровня выше — раскладка рабочего каталога Claude Code
+       (`<корень>/projects/<проект>/voice-input`), где ключи общие на все проекты.
+
+    Раньше здесь стоял абсолютный путь `D:/Claude/keys.local`. Для одной машины это
+    работало, но делало проект непереносимым: на чужом компьютере ключи не находятся
+    вовсе, а сообщение об ошибке называет каталог, которого у человека нет.
+    """
+    env = os.environ.get("VOICE_KEYS_FILE")
+    if env:
+        return Path(env)
+    local = BASE_DIR / ".env"
+    if local.exists():
+        return local
+    return BASE_DIR.parent.parent.parent / "keys.local"
+
+
+KEYS_FILE = keys_file()
+CONFIG_FILE = BASE_DIR / "config.json"
+GLOSSARY_FILE = BASE_DIR / "glossary.txt"
+STATUS_FILE = BASE_DIR / "_last_run.status"
+
+GROQ_BASE = "https://api.groq.com/openai/v1"
+SAMPLE_RATE = 16000  # Whisper всё равно работает на 16 кГц
+BLOCK_MS = 100
+
+DEFAULT_CONFIG = {
+    # Порядок предпочтения микрофонов. Bluetooth-гарнитура первой: если наушники
+    # надеты, диктуем в них. Подстроки КОРОТКИЕ намеренно — MME обрезает имена до
+    # 31 символа, и «HUAWEI FreeBuds» промахивается мимо «...(HUAWEI FreeBu».
+    "input_device_preferences": [
+        "HUAWEI FreeBu",
+        "Головной телефон",
+        "Denis Headphones",
+        "Internal Microphone",
+    ],
+    # CapsLock: единственная клавиша с собственной лампочкой, которую видит Windows
+    # (Fn обрабатывается контроллером клавиатуры и до системы не доходит вовсе —
+    # замер 2026-07-31). Её состояние и есть индикатор: горит — идёт запись.
+    "hotkey": "caps lock",
+    "cancel_hotkey": "alt+x",
+    "quit_hotkey": "ctrl+alt+q",
+    "show_overlay": True,          # полоса с таймером вверху экрана
+    "keep_recordings": True,       # сохранять аудио до отправки в облако
+    "recordings_dir": "_recordings",
+    "recordings_ttl_hours": 24,
+    "language": "ru",
+    "stt_model": "whisper-large-v3-turbo",
+    "normalize": True,
+    # 70b держит наклонение и вопросы 9/9, 8b — 5/9 при выигрыше всего 0.2 с (замер 2026-07-31).
+    # 8b оставлен фолбэком: у него отдельный, куда более щедрый суточный лимит.
+    "normalize_model": "llama-3.3-70b-versatile",
+    "normalize_fallback_model": "llama-3.1-8b-instant",
+    "silence_stop_sec": 2.5,
+    "wait_for_speech_sec": 15,
+    "max_record_sec": 600,        # тумблер: 10 минут, дальше упирается в лимит загрузки Groq
+    "auto_max_record_sec": 90,    # автостоп: промах VAD не должен стоить 5 минут
+    "warmup_ms": 800,       # ПОТОЛОК прогрева: столько ждёт BT-гарнитура перехода в HFP
+    # Сколько блоков подряд с сигналом считать признаком «устройство раскрутилось».
+    # Прогрев заканчивается на них, а не на потолке: встроенный микрофон слышит
+    # сразу, и держать его 800 мс — это ровно столько же секунд перед каждой
+    # диктовкой ни за что (замер 2026-08-05: старт записи 1.32 с -> 0.4 с).
+    "warmup_settle_blocks": 2,
+    "preroll_ms": 400,      # захлёст до начала речи, чтобы не срезать первый слог
+    "vad_factor": 3.5,      # во сколько раз громче фона должна быть речь
+    "vad_floor": 0.004,     # абсолютный минимум порога (тихая комната)
+    # --- скользящая подстройка под обстановку (см. AdaptiveVad) ---
+    "vad_release": 0.55,        # порог тишины ниже стартового: гистерезис
+    "vad_speech_cap": 0.35,     # потолок порога тишины как доля от громкости речи
+    "speech_onset_blocks": 2,   # сколько громких блоков подряд считать началом речи
+    "noise_window_sec": 4.0,    # окно скользящей переоценки фона
+    "noise_percentile": 15,     # какой перцентиль окна считать фоном
+    "noise_rise_rate": 0.05,    # как быстро фону разрешено расти (вниз — мгновенно)
+    "auto_paste": True,
+    "save_audio": False,
+    "beep": True,
+}
+
+# Типовые галлюцинации русского Whisper на тишине/шуме — если это ВЕСЬ текст, он мусорный.
+HALLUCINATIONS = [
+    "субтитры сделал dimatorzok",
+    "субтитры создавал dimatorzok",
+    "субтитры делал dimatorzok",
+    "продолжение следует",
+    "спасибо за просмотр",
+    "спасибо за внимание",
+    "подписывайтесь на канал",
+    "редактор субтитров",
+    "корректор",
+    "всем пока",
+    "до новых встреч",
+    "продолжение следует...",
+]
+
+
+# --------------------------------------------------------------------------- #
+# Конфиг, ключи, глоссарий
+# --------------------------------------------------------------------------- #
+
+QUIET = False  # включается ключом --quiet: слэш-команде /voice лишний лог не нужен
+
+LOG_FILE = BASE_DIR / "_daemon.log"
+LOG_MAX_BYTES = 512 * 1024  # ~5 тысяч строк: месяц диктовок, читается целиком
+_LOG_LOCK = threading.Lock()
+
+
+def _log_to_file(msg):
+    """
+    Дублирует строку в файл — ВСЕГДА, независимо от того, как запущен процесс.
+
+    Раньше файл наполнялся только перенаправлением из start_hotkey.cmd. Демон,
+    поднятый любым другим способом (Start-Process, автозапуск, вручную), оставался
+    немым: pythonw консоли не имеет, stderr уходит в никуда. Так и вышло 2026-08-05 —
+    предупреждение «микрофон слышит очень тихо» было выдано и потеряно, а разбирать
+    жалобу пришлось по косвенным следам. Логирование, которое зависит от способа
+    запуска, — это логирование, которого нет.
+
+    QUIET здесь НЕ действует: он глушит консоль, чтобы не пачкать контекст Claude,
+    а файл нужен именно тогда, когда на экране ничего не видно.
+    """
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n"
+    try:
+        with _LOG_LOCK:
+            if LOG_FILE.exists() and LOG_FILE.stat().st_size > LOG_MAX_BYTES:
+                # Половинная обрезка вместо архива: пары файлов на диске никто не
+                # ждёт, а свежий хвост важнее полной истории.
+                tail = LOG_FILE.read_text(encoding="utf-8", errors="replace")
+                keep = tail[len(tail) // 2:].split("\n", 1)[-1]
+                LOG_FILE.write_text(f"--- лог обрезан ---\n{keep}", encoding="utf-8")
+            with LOG_FILE.open("a", encoding="utf-8") as f:
+                f.write(line)
+    except OSError:
+        pass  # диск полон или файл занят — это не повод ронять запись
+
+
+def log(msg):
+    """
+    Диагностика: в stderr для человека у консоли и в файл — для разбора потом.
+
+    В режиме QUIET консоль глушится вся, кроме ошибок: вывод слэш-команды попадает
+    Claude в контекст, и десяток строк [info] там — мусор. Ошибки остаются всегда,
+    иначе «текста нет, и непонятно почему». В файл пишется всё и всегда.
+    """
+    _log_to_file(msg)
+    if QUIET and not msg.startswith("[error]"):
+        return
+    print(msg, file=sys.stderr, flush=True)
+
+
+def write_status(msg):
+    """Статус-файл: читается одним cat, не зависит от буферизации (CLAUDE.md §наблюдаемость)."""
+    try:
+        STATUS_FILE.write_text(
+            f"{time.strftime('%Y-%m-%d %H:%M:%S')} | {msg}\n", encoding="utf-8"
+        )
+    except OSError:
+        pass
+
+
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    if CONFIG_FILE.exists():
+        try:
+            cfg.update(json.loads(CONFIG_FILE.read_text(encoding="utf-8")))
+        except (OSError, json.JSONDecodeError) as e:
+            log(f"[warn] config.json не прочитан ({e}), беру значения по умолчанию")
+    return cfg
+
+
+def load_groq_keys():
+    """
+    Возвращает список ключей Groq. Значения НЕ печатаются нигде — только их количество.
+    Два ключа = два независимых суточных бюджета (service-notes/groq.md).
+    """
+    keys = []
+    if KEYS_FILE.exists():
+        for line in KEYS_FILE.read_text(encoding="utf-8", errors="ignore").splitlines():
+            m = re.match(r"^\s*(GROQ_API_KEY(?:_\d+)?)\s*=\s*(\S+)\s*$", line)
+            if m:
+                keys.append(m.group(2))
+    env_key = os.environ.get("GROQ_API_KEY")
+    if env_key:
+        keys.insert(0, env_key)
+    # dedupe, порядок сохраняем
+    seen, out = set(), []
+    for k in keys:
+        if k not in seen:
+            seen.add(k)
+            out.append(k)
+    return out
+
+
+def load_glossary():
+    if GLOSSARY_FILE.exists():
+        terms = [
+            t.strip()
+            for t in GLOSSARY_FILE.read_text(encoding="utf-8").splitlines()
+            if t.strip() and not t.strip().startswith("#")
+        ]
+        return terms
+    return []
+
+
+def whisper_prompt(terms):
+    """
+    Параметр prompt у Whisper — не инструкция, а «контекст предыдущего фрагмента».
+    Модель подхватывает из него написание терминов. Лимит ~224 токена, поэтому режем.
+    """
+    if not terms:
+        return None
+    text = "Рабочий контекст: " + ", ".join(terms) + "."
+    return text[:900]
+
+
+def session_terms(cfg):
+    """
+    Глоссарий плюс разовые термины этого запроса (`extra_terms`).
+
+    Глоссарий — постоянный словарь Дениса (CLAUDE.md §10). `extra_terms` живут один
+    вызов: это варианты ответа на конкретный вопрос. Разница принципиальная — вариант
+    «JSON» нужен ровно сейчас и не должен вытеснять из подсказки постоянные термины,
+    поэтому разовые идут ПЕРВЫМИ (обрезка prompt'а бьёт по хвосту).
+    """
+    extra = [str(t).strip() for t in (cfg.get("extra_terms") or []) if str(t).strip()]
+    base = load_glossary()
+    seen, out = set(), []
+    for t in extra + base:
+        if t.lower() not in seen:
+            seen.add(t.lower())
+            out.append(t)
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Сопоставление ответа с предложенными вариантами
+# --------------------------------------------------------------------------- #
+
+# Служебные слова: в вариантах вроде «Отдать текст как есть» они есть почти всегда
+# и совпадают с чем угодно. «да»/«нет» намеренно НЕ здесь — это часто и есть ответ.
+_STOPWORDS = {
+    "и", "а", "но", "в", "во", "на", "с", "со", "по", "для", "же", "ли", "бы", "к",
+    "у", "о", "об", "из", "за", "то", "это", "как", "что", "чем", "при", "до", "или",
+}
+
+_ORDINALS = [
+    ("перв", 0), ("втор", 1), ("трет", 2), ("четверт", 3), ("пят", 4),
+]
+
+MIN_STEM = 5  # общий префикс короче — уже не слово, а приставка («пере», "прог")
+
+
+def _norm_words(text):
+    """Слова в сравнимом виде: без регистра, ё, пунктуации и хвостов вроде «.json»."""
+    low = (text or "").lower().replace("ё", "е")
+    return [w for w in re.split(r"[^0-9a-zа-я]+", low) if w]
+
+
+def _same_word(a, b):
+    """
+    Равны или растут из одного корня.
+
+    Словоформы («переписывать» / «переписать») сравниваются по общему префиксу, но
+    только начиная с пяти букв: «пере» одинаково начинает «перенести» и «переписать»,
+    и на четырёх буквах матчер начал бы путать соседние варианты.
+    """
+    if a == b:
+        return True
+    if len(a) < MIN_STEM or len(b) < MIN_STEM:
+        return False
+    n = min(len(a), len(b))
+    common = 0
+    while common < n and a[common] == b[common]:
+        common += 1
+    return common >= MIN_STEM
+
+
+def match_option(text, options):
+    """
+    Свободный устный ответ -> один из предложенных вариантов.
+
+    Возвращает (вариант | None, «exact» | «likely» | «none»).
+
+    Зачем детерминированно, а не моделью: список вариантов известен заранее, и выбор
+    из трёх слов не стоит ни сетевого запроса, ни его недетерминированности. Матчер
+    обязан молчать («none»), когда ответ ушёл в сторону («на твоё усмотрение») —
+    подогнать такое под ближайший вариант хуже, чем честно отдать текст наверх.
+    """
+    if not text or not options:
+        return None, "none"
+
+    said = _norm_words(text)
+    if not said:
+        return None, "none"
+
+    scored = []
+    for opt in options:
+        opt_words = [w for w in _norm_words(opt) if w not in _STOPWORDS]
+        if not opt_words:
+            opt_words = _norm_words(opt)
+        if not opt_words:
+            continue
+        hits = sum(1 for w in opt_words if any(_same_word(w, s) for s in said))
+        scored.append((hits / len(opt_words), hits, opt))
+
+    if scored:
+        scored.sort(key=lambda x: (-x[0], -x[1]))
+        best = scored[0]
+        rivals = [s for s in scored[1:] if abs(s[0] - best[0]) < 1e-9]
+        if best[1] and not rivals:
+            if best[0] >= 0.999:
+                return best[2], "exact"
+            if best[0] >= 0.5:
+                return best[2], "likely"
+
+    # «давай второй» — про вариант говорят номером, слов из него в ответе нет
+    for stem, idx in _ORDINALS:
+        if idx < len(options) and any(w.startswith(stem) for w in said):
+            return options[idx], "likely"
+
+    return None, "none"
+
+
+# --------------------------------------------------------------------------- #
+# Выбор устройства ввода
+# --------------------------------------------------------------------------- #
+
+def list_input_devices():
+    out = []
+    for idx, dev in enumerate(sd.query_devices()):
+        if dev["max_input_channels"] > 0:
+            api = sd.query_hostapis(dev["hostapi"])["name"]
+            out.append(
+                {
+                    "index": idx,
+                    "name": dev["name"],
+                    "api": api,
+                    "channels": dev["max_input_channels"],
+                    "default_sr": int(dev["default_samplerate"]),
+                }
+            )
+    return out
+
+
+# Порядок доверия к звуковым API Windows для ЗАХВАТА.
+# Замер 2026-07-31 на FreeBuds 6i: один и тот же микрофон через MME отдаёт сигнал,
+# а через DirectSound — ровный цифровой ноль (профиль HFP не поднимается).
+# WASAPI ставим между ними: он рабочий, но чаще отказывает на 16 кГц.
+# WDM-KS исключён совсем — требует эксклюзивного доступа и падает, если звук занят.
+API_RANK = {"MME": 0, "Windows WASAPI": 1, "Windows DirectSound": 2}
+
+
+def rank_input_devices(preferences):
+    """
+    Кандидаты в микрофоны, от самого желанного к запасным.
+
+    Отбор по подстроке имени в порядке `preferences`, внутри одного предпочтения —
+    по надёжности API. Возвращается СПИСОК, а не один вариант: устройство может
+    существовать, открыться и при этом отдавать тишину, и тогда нужен следующий.
+
+    Про подстроки: MME обрезает имена до 31 символа, поэтому «Головной телефон
+    (HUAWEI FreeBuds 6i)» там выглядит как «Головной телефон (HUAWEI FreeBu».
+    Предпочтения задавать короткими кусками, иначе они промахиваются мимо MME.
+    """
+    devices = [d for d in list_input_devices() if "WDM-KS" not in d["api"]]
+    out, seen = [], set()
+    for pref in preferences:
+        pref_low = pref.lower()
+        matched = [d for d in devices if pref_low in d["name"].lower()]
+        matched.sort(key=lambda d: (API_RANK.get(d["api"], 9), d["index"]))
+        for d in matched:
+            # Один физический микрофон system показывает трижды — через MME,
+            # DirectSound и WASAPI. Оставляем только лучший вариант: если он молчит,
+            # молчит сам микрофон, и перебирать его же через другой драйвер
+            # бессмысленно — надо переходить к следующему УСТРОЙСТВУ.
+            # Ключ обрезан до 25 символов: MME режет имена до 31, и полное
+            # «…(HUAWEI FreeBuds 6i)» иначе не совпадёт с «…(HUAWEI FreeBu».
+            key = d["name"].lower()[:25]
+            if key not in seen:
+                seen.add(key)
+                out.append((d["index"], f"{d['name']} [{d['api']}]"))
+    return out
+
+
+def pick_input_device(preferences):
+    """Первый кандидат (index, name) либо (None, 'системный по умолчанию')."""
+    ranked = rank_input_devices(preferences)
+    return ranked[0] if ranked else (None, "системный по умолчанию")
+
+
+# --------------------------------------------------------------------------- #
+# Запись
+# --------------------------------------------------------------------------- #
+
+class AdaptiveVad:
+    """
+    Детектор речи со скользящей подстройкой под обстановку.
+
+    Почему не хватило однократной калибровки (замер в кафе 2026-07-31): порог
+    снимался один раз, на открытии потока, когда устройство ещё раскручивалось и
+    отдавало цифровой ноль. Порог упал на абсолютный минимум, реальный гул кафе
+    оказался выше него — и «тишина» не наступила ни разу: запись шла 300 с вместо 11.
+    Любая однократная калибровка ломается, если обстановка меняется после неё.
+
+    Отсюда три свойства:
+
+    * **Фон переоценивается непрерывно** — нижний перцентиль RMS за скользящее окно.
+      Паузы между словами попадают в окно даже посреди фразы, поэтому оценку можно
+      обновлять всегда. Вниз она идёт мгновенно, вверх — медленно: иначе собственная
+      речь задерёт «фон» и оборвёт запись на середине.
+    * **Порогов два (гистерезис).** Начать запись труднее, чем продолжить: стук чашки
+      не должен стартовать диктовку, а короткая пауза не должна её обрывать.
+    * **Порог тишины ограничен сверху долей от громкости самой речи.** В гуле
+      абсолютные пороги бессмысленны, а «в 3 раза тише, чем говорит хозяин микрофона» —
+      признак, устойчивый к любому фону. Этот потолок только ОПУСКАЕТ порог: он
+      страхует от обрыва живой фразы, а не поднимает планку в тихой комнате.
+    """
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.window = deque(maxlen=max(6, int(cfg["noise_window_sec"] * 1000 / BLOCK_MS)))
+        self.noise = 0.0
+        self.speech = 0.0
+
+    def prime(self, rms_values):
+        """Первичная оценка по прогреву. Медиана — чтобы щелчок HFP не задрал фон."""
+        for v in rms_values:
+            self.window.append(v)
+        if rms_values:
+            self.noise = float(np.median(rms_values))
+
+    def feed(self, rms, in_speech):
+        self.window.append(rms)
+        if len(self.window) >= 6:
+            observed = float(np.percentile(self.window, self.cfg["noise_percentile"]))
+            if observed <= self.noise:
+                self.noise = observed  # стало тише — верим сразу
+            else:
+                self.noise += (observed - self.noise) * self.cfg["noise_rise_rate"]
+
+        if in_speech and rms > self.start_threshold:
+            # типичный уровень речи, а не пик: пик даёт слишком высокий порог тишины
+            self.speech = rms if self.speech <= 0 else self.speech * 0.9 + rms * 0.1
+
+        if self.speech > 0:
+            # фон физически не может быть громче половины речи: если оценка туда
+            # уехала, значит в окно попала сама речь
+            self.noise = min(self.noise, self.speech * 0.5)
+
+    @property
+    def start_threshold(self):
+        return max(self.noise * self.cfg["vad_factor"], self.cfg["vad_floor"])
+
+    @property
+    def stop_threshold(self):
+        by_noise = max(
+            self.noise * self.cfg["vad_factor"],
+            self.cfg["vad_floor"],
+        ) * self.cfg["vad_release"]
+        if self.speech > 0:
+            return min(by_noise, self.speech * self.cfg["vad_speech_cap"])
+        return by_noise
+
+
+class Recorder:
+    """
+    Захват с микрофона в float32 mono 16 кГц.
+
+    Два режима остановки:
+      * record_auto()   — автостоп по тишине (для /voice, там нет второго нажатия);
+      * start()/stop()  — ручной тумблер (для хоткея).
+    """
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        # Тестовый режим: вместо микрофона отдаём WAV блоками в реальном времени.
+        # Нужен потому, что честный loopback «динамики -> микрофон» на Windows
+        # невозможен: драйвер вычитает из входа то, что система вывела (AEC).
+        self.fake_wav = cfg.get("fake_mic_wav") or os.environ.get("VOICE_FAKE_MIC")
+        self.device, self.device_name = (
+            (None, f"ПОДСТАВНОЙ ФАЙЛ {Path(self.fake_wav).name}")
+            if self.fake_wav
+            else pick_input_device(cfg["input_device_preferences"])
+        )
+        self.blocksize = int(SAMPLE_RATE * BLOCK_MS / 1000)
+        self._stream = None
+        self._blocks = []
+        self._preroll = deque(maxlen=max(1, int(cfg["preroll_ms"] / BLOCK_MS)))
+        self._noise_rms = None
+        self._recording = False
+        self._fake_audio = None
+        self._fake_pos = 0
+        self.last_rms = 0.0  # громкость последнего блока — для экранного индикатора
+        # Результат прогрева, снятый уже при выборе устройства: (vad, блоки).
+        # Раньше те же блоки читались дважды — сперва чтобы решить, живо ли
+        # устройство, потом чтобы прогреть его и оценить фон. Это стоило лишних
+        # 0.3 с на каждом старте записи (замер 2026-08-05).
+        self._warm = None
+
+    # -- низкий уровень ----------------------------------------------------- #
+
+    def _open_fake(self):
+        """
+        Подставной микрофон: WAV вместо устройства.
+
+        Кроме самой фразы умеет подмешивать фоновый гул и добавлять хвост после неё —
+        так воспроизводится «диктую в кафе»: пока человек молчит, в микрофон всё равно
+        идёт шум. Без этого автостоп проверить нечем: файл просто кончается тишиной,
+        и любой, даже сломанный, VAD выглядит рабочим.
+
+        `fake_mic_noise_start_sec` отдельно воспроизводит главный сценарий отказа —
+        фон появляется ПОСЛЕ калибровки (микрофон раскрутился, кофемашина включилась).
+        """
+        with wave.open(str(self.fake_wav), "rb") as w:
+            sr = w.getframerate()
+            frames = w.readframes(w.getnframes())
+            data = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+            if w.getnchannels() > 1:
+                data = data.reshape(-1, w.getnchannels()).mean(axis=1)
+        if sr != SAMPLE_RATE:
+            data = resample_to_16k(data, sr)
+
+        cfg = self.cfg
+        rng = np.random.default_rng(7)
+        # Почти-тишина в начале — чтобы прогреву было что мерить как фон. Уровень
+        # настраиваемый: по умолчанию это уже раскрученный микрофон, но тест фазы
+        # разгона обязан уметь опустить его ниже порога готовности — иначе
+        # подставное устройство «готово» с первого блока, и ожидание не проверить.
+        lead_rms = float(cfg.get("fake_mic_lead_rms", 0.0002))
+        lead = rng.normal(0, lead_rms, SAMPLE_RATE // 2).astype(np.float32)
+        tail_sec = float(cfg.get("fake_mic_tail_sec", 8.0))
+        tail = rng.normal(0, 0.0002, int(SAMPLE_RATE * tail_sec)).astype(np.float32)
+        full = np.concatenate([lead, data, tail])
+
+        noise_rms = float(cfg.get("fake_mic_noise_rms") or 0.0)
+        if noise_rms > 0:
+            noise = rng.normal(0, noise_rms, len(full)).astype(np.float32)
+            start = int(SAMPLE_RATE * float(cfg.get("fake_mic_noise_start_sec", 0.0)))
+            if start > 0:
+                noise[:start] = 0.0
+            full = full + noise
+
+        self._fake_audio = full
+        self._fake_pos = 0
+        self.native_sr = SAMPLE_RATE
+
+    def _open(self):
+        if self.fake_wav:
+            return self._open_fake()
+        return self._open_real()
+
+    def _start_stream(self, device):
+        """
+        Пробуем открыть поток прямо на 16 кГц: в shared-режиме Windows сама делает
+        качественный ресемпл из 44.1/48 кГц. Если устройство отказывает — падаем на
+        его родную частоту и ресемплим вручную.
+        """
+        self.native_sr = SAMPLE_RATE
+        self.blocksize = int(SAMPLE_RATE * BLOCK_MS / 1000)
+        try:
+            self._stream = sd.InputStream(
+                device=device, channels=1, samplerate=SAMPLE_RATE,
+                blocksize=self.blocksize, dtype="float32",
+            )
+            self._stream.start()
+        except Exception as e:  # noqa: BLE001 — на Windows тут зоопарк исключений PortAudio
+            log(f"[info] 16 кГц недоступны ({str(e)[:60]}); беру родную частоту")
+            info = sd.query_devices(device if device is not None else sd.default.device[0])
+            self.native_sr = int(info["default_samplerate"])
+            self.blocksize = int(self.native_sr * BLOCK_MS / 1000)
+            self._stream = sd.InputStream(
+                device=device, channels=1, samplerate=self.native_sr,
+                blocksize=self.blocksize, dtype="float32",
+            )
+            self._stream.start()
+
+    # Порог «устройство вообще работает». Отвергаем ТОЛЬКО ровный цифровой ноль —
+    # заглушку драйвера (DirectSound на FreeBuds отдаёт именно её).
+    #
+    # Соблазнительно было поднять порог до 1e-4 и так отсеивать снятую гарнитуру
+    # (она шумит на 0.00002). Замер это опроверг: микрофон ноутбука в тихой комнате
+    # даёт РОВНО СТОЛЬКО ЖЕ. «Гарнитура снята» и «в комнате тихо» по уровню фона
+    # неразличимы, и порог отвергал исправный микрофон. Поэтому — только ноль,
+    # а сомнительный уровень отдаём человеку предупреждением: он-то знает, надеты
+    # ли наушники.
+    LIVE_LEVEL = 1e-6
+    QUIET_HINT_LEVEL = 1e-4
+
+    def _probe(self):
+        """
+        Прогревает открытый поток и заодно оценивает, слышит ли он хоть что-то.
+
+        Возвращает (уровень, блоки, rms-блоков). Блоки не выбрасываются: их отдают
+        либо в запись, либо на калибровку фона — читать одно и то же дважды дорого,
+        а на старте записи дороги именно первые доли секунды.
+
+        Длительность НЕ фиксированная: ждём, пока устройство раскрутится, но не
+        дольше warmup_ms. Константа 800 мс была рассчитана на худший случай —
+        Bluetooth-гарнитуру, переходящую из A2DP в HFP. Держать столько же микрофон,
+        который готов за 200 мс, значит платить полсекунды перед каждой диктовкой.
+
+        Порог готовности — QUIET_HINT_LEVEL, а НЕ LIVE_LEVEL, хотя оба про уровень
+        сигнала. Это разные вопросы. «Живой» (1e-6) отделяет устройство-заглушку от
+        настоящего входа и обязан быть мягким: в тихой комнате исправный микрофон
+        отдаёт немного. «Раскрутился» (1e-4) отделяет готовность от разгона и обязан
+        быть строгим: замер 2026-08-05 показал, что встроенный микрофон первые
+        500-600 мс выдаёт 0.000014 — формально не ноль, фактически ещё ничего.
+        Спутать эти пороги — значит объявить готовым микрофон, который пока глухой,
+        и получить запись с уровнем 0.00007 вместо речи.
+        """
+        limit = max(1, int(self.cfg["warmup_ms"] / BLOCK_MS))
+        settle = max(1, int(self.cfg.get("warmup_settle_blocks", 2)))
+        blocks, rms_values, ready_streak = [], [], 0
+        for _ in range(limit):
+            block = self._read_block()
+            blocks.append(block)
+            rms = float(np.sqrt(np.mean(block ** 2)))
+            rms_values.append(rms)
+            if rms >= self.QUIET_HINT_LEVEL:
+                ready_streak += 1
+                if ready_streak >= settle:
+                    break  # устройство раскручено, дальше ждать нечего
+            else:
+                ready_streak = 0
+        return max(rms_values), blocks, rms_values
+
+    def _open_real(self):
+        """
+        Открывает лучший кандидат по УРОВНЮ сигнала, а не первый попавшийся.
+
+        Почему мало «поток открылся»: тот же микрофон гарнитуры через MME отдаёт
+        сигнал, а через DirectSound — ровный цифровой ноль. Почему мало «сэмплы не
+        нулевые»: снятая гарнитура шумит на уровне 0.00002 — формально жива, а
+        диктовать в неё бесполезно, человек-то говорит в ноутбук.
+
+        Поэтому кандидаты перебираются по порядку предпочтения, берётся первый
+        уверенно живой, а если таких нет — самый громкий из осмотренных. Проверка
+        совмещена с прогревом: это одно и то же чтение блоков, разделять его значило
+        бы платить за старт записи дважды.
+        """
+        candidates = rank_input_devices(self.cfg["input_device_preferences"])
+        candidates.append((None, "системный по умолчанию"))  # последняя надежда
+
+        best = None  # (уровень, idx, name)
+        for idx, name in candidates:
+            try:
+                self._start_stream(idx)
+            except Exception as e:  # noqa: BLE001
+                log(f"[warn] {name}: поток не открылся ({str(e)[:70]})")
+                continue
+
+            level, blocks, rms_values = self._probe()
+            if level >= self.LIVE_LEVEL:
+                self.device, self.device_name = idx, name
+                self._warm = (blocks, rms_values)
+                if level < self.QUIET_HINT_LEVEL:
+                    # Не ошибка: возможно, просто тихо. Но если это гарнитура и она
+                    # лежит на столе, диктовка уйдёт в никуда — пусть человек знает.
+                    log(f"[warn] {name} слышит очень тихо (уровень {level:.5f}). "
+                        f"Если гарнитура не надета — укажите другой микрофон "
+                        f"ключом --device")
+                return
+            if best is None or level > best[0]:
+                best = (level, idx, name)
+            log(f"[warn] {name}: цифровая тишина — устройство-заглушка, беру следующее")
+            self._close()
+
+        if best is None:
+            raise RuntimeError("ни один микрофон не открылся")
+        level, idx, name = best
+        self.device, self.device_name = idx, name
+        log(f"[warn] уверенного сигнала нет нигде, беру самый громкий: "
+            f"{name} (уровень {level:.5f})")
+        self._start_stream(idx)
+
+    def _read_block(self):
+        block = self._read_block_raw()
+        # Громкость последнего блока — её показывает экранный индикатор. Считаем
+        # здесь, в одной точке: иначе каждый режим записи мерил бы её по-своему.
+        self.last_rms = float(np.sqrt(np.mean(block ** 2)))
+        return block
+
+    def _read_block_raw(self):
+        if self.fake_wav:
+            # По умолчанию отдаём в реальном времени: тумблер демона и хоткеи иначе
+            # не успевают отработать, и тест проверял бы не ту механику. Логика VAD
+            # блочная и от часов не зависит, поэтому её тесты гоняют без задержки.
+            if self.cfg.get("fake_mic_realtime", True):
+                time.sleep(BLOCK_MS / 1000.0)
+            start, end = self._fake_pos, self._fake_pos + self.blocksize
+            self._fake_pos = end
+            if start >= len(self._fake_audio):
+                return np.zeros(self.blocksize, dtype=np.float32)  # файл кончился — тишина
+            chunk = self._fake_audio[start:end]
+            if len(chunk) < self.blocksize:
+                chunk = np.pad(chunk, (0, self.blocksize - len(chunk)))
+            return chunk.astype(np.float32)
+
+        data, overflowed = self._stream.read(self.blocksize)
+        if overflowed:
+            log("[warn] input overflow (пропуск сэмплов)")
+        return data[:, 0].copy()
+
+    def _close(self):
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            finally:
+                self._stream = None
+
+    def _warmup(self, keep=None, full=False):
+        """
+        Прогрев потока + первичная оценка фона. Возвращает готовый AdaptiveVad.
+
+        Зачем прогрев: Bluetooth-гарнитура переключается из A2DP в HFP не мгновенно —
+        первые сотни миллисекунд приходит тишина или щелчок. Если начать VAD сразу,
+        первый слог уедет в pre-roll.
+
+        Зачем отбрасывать «мёртвые» блоки: пока устройство раскручивается, оно отдаёт
+        ЦИФРОВОЙ ноль. Медиана по таким блокам даёт фон 0.0000, порог падает на
+        абсолютный минимум — и в шумном месте тишина не наступает никогда. Берём только
+        блоки с сигналом; если их нет вовсе — не беда, дальше фон переоценивается на ходу.
+
+        `keep` — куда сложить прогревочные блоки. В режиме тумблера человек нажимает
+        и говорит сразу, не дожидаясь готовности микрофона: выбросить эти блоки
+        значит срезать ему первое слово. Детектору речи они не нужны — в тумблере он
+        не работает вовсе, — но в записи им самое место.
+
+        `full` — дочитать до полных warmup_ms, даже если устройство готово раньше.
+        Прогрев отвечает на два РАЗНЫХ вопроса: «раскрутился ли микрофон» и «какой
+        здесь фон». Первому хватает пары блоков с сигналом. Второму нужна выборка:
+        медиана по двум блокам — не оценка шума, а случайное число, и порог тишины
+        по ней уезжает. Поэтому режим с автостопом просит full=True, а тумблер, где
+        детектор речи не работает вовсе, довольствуется готовностью и стартует
+        вдвое быстрее. Слитые вместе, эти требования дают либо медленный старт,
+        либо разъезжающийся VAD (регрессия поймана тестом тишины 2026-08-05).
+        """
+        if self._warm is not None:
+            blocks, rms_values = self._warm
+            self._warm = None  # блоки одноразовые: во второй раз это уже не прогрев
+        else:
+            # Сюда попадают пути, где устройство не выбиралось перебором: подставной
+            # микрофон и запасной кандидат. Читаем тем же _probe, а не отдельным
+            # циклом на полный warmup_ms: иначе ожидание готовности ведёт себя
+            # по-разному в бою и в тестах, и тест перестаёт что-либо доказывать.
+            _, blocks, rms_values = self._probe()
+
+        if full:
+            need = max(1, int(self.cfg["warmup_ms"] / BLOCK_MS)) - len(blocks)
+            for _ in range(need):
+                block = self._read_block()
+                blocks.append(block)
+                rms_values.append(float(np.sqrt(np.mean(block ** 2))))
+
+        if keep is not None:
+            keep.extend(blocks)
+
+        alive = [v for v in rms_values if v > 1e-6]
+        vad = AdaptiveVad(self.cfg)
+        vad.prime(alive or rms_values)
+        self._noise_rms = vad.noise
+        log(
+            f"[info] фон={vad.noise:.4f} старт речи={vad.start_threshold:.4f} "
+            f"тишина={vad.stop_threshold:.4f}"
+            + ("" if alive else " (микрофон молчал на прогреве — калибрую на ходу)")
+        )
+        return vad
+
+    # -- публичные режимы --------------------------------------------------- #
+
+    def record_auto(self, on_ready=None):
+        """
+        Пишет до паузы. Возвращает np.ndarray или None, если речи не было.
+        on_ready вызывается ПОСЛЕ прогрева — только тогда честно говорить «говорите».
+        """
+        self._open()
+        try:
+            # full=True: здесь работает детектор речи, и порог тишины считается по
+            # фону — оценке нужна выборка, а не два блока «устройство ожило».
+            vad = self._warmup(full=True)
+            if on_ready:
+                on_ready()
+
+            cfg = self.cfg
+            silence_needed = int(cfg["silence_stop_sec"] * 1000 / BLOCK_MS)
+            onset_needed = max(1, int(cfg["speech_onset_blocks"]))
+            wait_blocks = int(cfg["wait_for_speech_sec"] * 1000 / BLOCK_MS)
+            # автостоп рискованнее тумблера: тут никто не нажмёт «стоп», если VAD промахнулся
+            max_blocks = int(
+                cfg.get("auto_max_record_sec", cfg["max_record_sec"]) * 1000 / BLOCK_MS
+            )
+
+            self._preroll.clear()
+            speech_started = False
+            loud_run = silence_run = waited = 0
+            collected = []
+            reason = "пауза"
+
+            while True:
+                block = self._read_block()
+                rms = float(np.sqrt(np.mean(block ** 2)))
+                vad.feed(rms, speech_started)
+
+                if not speech_started:
+                    self._preroll.append(block)
+                    waited += 1
+                    # одиночный хлопок (дверь, чашка о блюдце) не должен начинать диктовку
+                    loud_run = loud_run + 1 if rms > vad.start_threshold else 0
+                    if loud_run >= onset_needed:
+                        speech_started = True
+                        collected.extend(self._preroll)
+                        write_status("речь началась")
+                    elif waited >= wait_blocks:
+                        write_status("тишина: речь не началась")
+                        return None
+                    continue
+
+                collected.append(block)
+                silence_run = 0 if rms > vad.stop_threshold else silence_run + 1
+                if silence_run >= silence_needed:
+                    break
+                if len(collected) >= max_blocks:
+                    reason = f"максимум длительности ({max_blocks * BLOCK_MS / 1000:.0f} с)"
+                    log(f"[warn] {reason} — останавливаю запись")
+                    break
+
+            # хвостовая тишина не нужна ни Whisper, ни счётчику секунд: оставляем
+            # 0.3 с, чтобы не срезать затухание последнего слова
+            keep = 3
+            if silence_run > keep:
+                collected = collected[: len(collected) - (silence_run - keep)]
+            log(
+                f"[info] стоп: {reason}; фон={vad.noise:.4f} речь={vad.speech:.4f} "
+                f"порог тишины={vad.stop_threshold:.4f}"
+            )
+            audio = np.concatenate(collected) if collected else None
+            return self._finalize(audio)
+        finally:
+            self._close()
+
+    def start(self, on_ready=None):
+        """Тумблер: начать писать до явного stop()."""
+        self._open()
+        self._blocks = []
+        self._warmup(keep=self._blocks)  # прогрев — уже часть записи, не преамбула
+        self._recording = True
+        if on_ready:
+            on_ready()
+
+    def pump(self):
+        """Вызывается в цикле демона: забирает один блок. True — пока пишем."""
+        if not self._recording:
+            return False
+        self._blocks.append(self._read_block())
+        max_blocks = int(self.cfg["max_record_sec"] * 1000 / BLOCK_MS)
+        if len(self._blocks) >= max_blocks:
+            log("[warn] достигнут максимум длительности записи")
+            return False
+        return True
+
+    def stop(self):
+        self._recording = False
+        try:
+            audio = np.concatenate(self._blocks) if self._blocks else None
+            return self._finalize(audio)
+        finally:
+            self._blocks = []
+            self._close()
+
+    def _finalize(self, audio):
+        if audio is None or len(audio) == 0:
+            return None
+        if self.native_sr != SAMPLE_RATE:
+            audio = resample_to_16k(audio, self.native_sr)
+        return audio
+
+    @property
+    def duration_hint(self):
+        return len(self._blocks) * BLOCK_MS / 1000.0
+
+
+def resample_to_16k(audio, src_sr):
+    """
+    Даунсемпл с антиалиасингом на голом numpy (scipy не тянем ради одной функции).
+    Сначала FIR low-pass (окно Хэмминга, срез 7.8 кГц), затем линейная интерполяция:
+    без фильтра высокие частоты завернулись бы в слышимый шум и подпортили распознавание.
+    """
+    if src_sr == SAMPLE_RATE:
+        return audio
+    cutoff = 7800.0 / src_sr  # нормированная частота среза
+    num_taps = 101
+    n = np.arange(num_taps) - (num_taps - 1) / 2
+    h = np.sinc(2 * cutoff * n) * np.hamming(num_taps)
+    h /= np.sum(h)
+    filtered = np.convolve(audio, h, mode="same")
+
+    duration = len(filtered) / src_sr
+    new_len = int(duration * SAMPLE_RATE)
+    x_old = np.linspace(0, duration, len(filtered), endpoint=False)
+    x_new = np.linspace(0, duration, new_len, endpoint=False)
+    return np.interp(x_new, x_old, filtered).astype(np.float32)
+
+
+def cleanup_recordings(folder, ttl_hours):
+    """Удаляет записи старше TTL. Возвращает, сколько убрал."""
+    if ttl_hours <= 0:
+        return 0
+    deadline = time.time() - ttl_hours * 3600
+    removed = 0
+    for path in folder.glob("*.wav"):
+        try:
+            if path.stat().st_mtime < deadline:
+                path.unlink()
+                removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def save_recording(audio, cfg, prefix="rec"):
+    """
+    Сохраняет запись на диск ДО отправки в облако.
+
+    Зачем: диктовка на несколько минут — это несколько минут работы человека, и
+    терять её из-за сетевого сбоя, исчерпанного лимита или упавшего процесса нельзя.
+    Файл остаётся, и его всегда можно прогнать заново: `voice_once.py --file <путь>`.
+
+    Хранится в папке проекта (не на системном диске) и подчищается по TTL.
+    """
+    if not cfg.get("keep_recordings", True):
+        return None
+    folder = BASE_DIR / cfg.get("recordings_dir", "_recordings")
+    try:
+        folder.mkdir(exist_ok=True)
+        removed = cleanup_recordings(folder, float(cfg.get("recordings_ttl_hours", 24)))
+        path = folder / f"{prefix}_{time.strftime('%Y%m%d_%H%M%S')}.wav"
+        path.write_bytes(audio_to_wav_bytes(audio))
+        note = f", убрано старых: {removed}" if removed else ""
+        log(f"[info] запись сохранена: {path.name} "
+            f"({len(audio) / SAMPLE_RATE:.1f} с{note})")
+        return path
+    except OSError as e:
+        log(f"[warn] не удалось сохранить запись: {e}")
+        return None
+
+
+def audio_to_wav_bytes(audio, sr=SAMPLE_RATE):
+    pcm = np.clip(audio, -1.0, 1.0)
+    pcm = (pcm * 32767).astype(np.int16)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sr)
+        w.writeframes(pcm.tobytes())
+    return buf.getvalue()
+
+
+# --------------------------------------------------------------------------- #
+# Распознавание и нормализация (Groq)
+# --------------------------------------------------------------------------- #
+
+def _groq_post(path, keys, *, files=None, data=None, json_body=None, timeout=90):
+    """
+    Запрос к Groq с перебором ключей: 429 на одном ключе — пробуем следующий.
+    У каждого ключа независимый суточный бюджет (service-notes/groq.md).
+    """
+    last_err = None
+    for i, key in enumerate(keys):
+        try:
+            r = requests.post(
+                f"{GROQ_BASE}{path}",
+                headers={"Authorization": f"Bearer {key}"},
+                files=files,
+                data=data,
+                json=json_body,
+                timeout=timeout,
+            )
+        except requests.RequestException as e:
+            last_err = f"сеть: {e}"
+            continue
+        if r.status_code == 200:
+            return r.json()
+        if r.status_code == 429:
+            # Тело 429 отличает лимит в минуту от суточного — это единственное место,
+            # где виден TPD (см. service-notes/groq.md).
+            last_err = f"429 (ключ #{i + 1}): {r.text[:200]}"
+            continue
+        last_err = f"HTTP {r.status_code}: {r.text[:300]}"
+        break
+    raise RuntimeError(f"Groq недоступен — {last_err}")
+
+
+def transcribe(audio, cfg, keys):
+    wav = audio_to_wav_bytes(audio)
+    terms = session_terms(cfg)
+    data = {
+        "model": cfg["stt_model"],
+        "response_format": "json",
+        "temperature": "0",
+    }
+    if cfg.get("language"):
+        data["language"] = cfg["language"]
+    prompt = whisper_prompt(terms)
+    if prompt:
+        data["prompt"] = prompt
+
+    t0 = time.time()
+    res = _groq_post(
+        "/audio/transcriptions",
+        keys,
+        files={"file": ("speech.wav", wav, "audio/wav")},
+        data=data,
+    )
+    text = (res.get("text") or "").strip()
+    log(f"[info] распознано за {time.time() - t0:.1f} с, {len(text)} симв.")
+    return text
+
+
+def is_hallucination(text):
+    """Whisper на тишине выдаёт фразы из ютуб-субтитров. Если это ВЕСЬ текст — мусор."""
+    clean = re.sub(r"[^\wа-яё ]", "", text.lower(), flags=re.IGNORECASE).strip()
+    if not clean:
+        return True
+    for h in HALLUCINATIONS:
+        h_clean = re.sub(r"[^\wа-яё ]", "", h).strip()
+        if clean == h_clean or (len(clean) < 40 and h_clean in clean):
+            return True
+    return False
+
+
+NORMALIZE_SYSTEM = """Ты — редактор устной речи. Пользователь диктует задачу для программиста голосом.
+Твоя работа: превратить расшифровку в чистый письменный текст, ничего не добавляя от себя.
+
+Правила:
+1. Убери слова-паразиты: ну, вот, короче, значит, как бы, там, то есть (если оно не несёт смысла), э-э, м-м.
+2. Убери повторы и самоперебивы — оставь финальную формулировку мысли.
+3. Расставь пунктуацию и заглавные буквы, разбей на предложения.
+4. Исправь термины по списку ниже, если слышно, что имелся в виду один из них.
+5. НЕ отвечай на вопрос и НЕ выполняй задачу — только приведи текст в порядок.
+6. НЕ добавляй ничего, чего не было сказано: ни выводов, ни уточнений, ни списков, если их не диктовали.
+7. Сохрани язык оригинала (русский). Верни ТОЛЬКО итоговый текст, без кавычек и пояснений.
+8. СТРОГО сохраняй лицо, число и наклонение глаголов. Сказано «посмотри» — оставь «посмотри»,
+   НИКОГДА не превращай в «посмотрим» или «нужно посмотреть». Сказано «я хочу» — оставь «я хочу».
+   Приказ остаётся приказом, вопрос остаётся вопросом.
+9. Не меняй порядок мыслей и не объединяй разные требования в одно предложение.
+10. Оставляй слова говорящего. Ты удаляешь мусор и ставишь знаки препинания — ты НЕ пересказываешь.
+11. Если сказанное было вопросом — итог ОБЯЗАН содержать вопросительный знак. Не превращай
+    вопрос в утверждение и не приклеивай к нему пояснение через запятую.
+
+Список рабочих терминов (правильное написание):
+{terms}"""
+
+# Few-shot: 8b-instant игнорирует словесный запрет менять наклонение, но уверенно
+# копирует поведение с примеров. Каждый пример закрывает свой типовой сбой.
+NORMALIZE_SHOTS = [
+    (
+        # повелительное наклонение — главный сбой: модель тянет его в «мы сделаем».
+        # Лексика намеренно НЕ пересекается с тестовыми фикстурами, иначе тест
+        # проверял бы копирование примера, а не работу редактора.
+        "короче добавь там в таблицу поле статуса ну и обнови потом сервис ноты",
+        "Добавь в таблицу поле статуса и потом обнови service-notes.",
+    ),
+    (
+        # первое лицо + самоперебив: «нет погоди» отменяет предыдущую формулировку
+        "я хочу чтобы бот отвечал быстрее то есть чтобы дебаунс был меньше нет погоди "
+        "не дебаунс а вот этот таймаут в поллере",
+        "Я хочу, чтобы бот отвечал быстрее — чтобы таймаут в поллере был меньше.",
+    ),
+    (
+        # вопрос обязан остаться вопросом, даже когда за ним идёт поясняющая фраза:
+        # типовой сбой — склеить оба предложения в одно утверждение
+        "слушай а почему там рассылка не уходит ну то есть она вроде висит но статус зелёный",
+        "Почему рассылка не уходит? Она висит, но статус зелёный.",
+    ),
+]
+
+
+# Глаголы-приказы, типовые для диктовки задач. Нужны не для морфологии, а для одной
+# проверки: если такое слово было в расшифровке и исчезло из редактуры — модель
+# переписала приказ («посмотри» → «посмотрю»/«посмотрим»), а это меняет смысл.
+IMPERATIVES = {
+    "посмотри", "глянь", "проверь", "сделай", "поправь", "исправь", "почини", "перепиши",
+    "напиши", "добавь", "удали", "убери", "замени", "обнови", "создай", "перенеси",
+    "запусти", "прогони", "протестируй", "задеплой", "закоммить", "выгрузи", "загрузи",
+    "отправь", "скинь", "залей", "подними", "погаси", "настрой", "поставь", "собери",
+    "посчитай", "сравни", "найди", "покажи", "объясни", "опиши", "оцени", "разберись",
+    "разбери", "спланируй", "начни", "продолжи", "останови", "верни", "сохрани",
+}
+
+
+def normalization_problems(raw, out):
+    """
+    Инварианты, которые редактор ломать не должен. Пустой список — всё в порядке.
+
+    Проверяем не «похоже ли на правду», а формальные признаки искажения: потерянный
+    вопрос, подменённое наклонение и уехавший объём. Всё видно без модели, а значит
+    проверка бесплатна и не врёт.
+    """
+    problems = []
+    if "?" in raw and "?" not in out:
+        problems.append("потерян вопросительный знак")
+
+    raw_words = set(re.findall(r"[а-яёa-z]+", raw.lower()))
+    out_lower = out.lower()
+    lost = sorted(w for w in raw_words & IMPERATIVES if w not in out_lower)
+    if lost:
+        problems.append("пропали глаголы в повелительном наклонении: " + ", ".join(lost))
+    ratio = len(out) / max(1, len(raw))
+    if ratio < 0.5:
+        problems.append(f"текст ужался в {1 / ratio:.1f}× (похоже на пересказ)")
+    elif ratio > 2.0:
+        problems.append(f"текст вырос в {ratio:.1f}× (похоже на дописку)")
+    return problems
+
+
+def fix_terms_case(text, terms):
+    """
+    Детерминированная правка написания терминов по глоссарию.
+
+    Почему не доверить это модели: LLM «чинит» и то, что трогать не просили, и делает
+    это по-разному от запуска к запуску. Простая замена регистра предсказуема и бесплатна.
+
+    Две стратегии по алфавиту термина:
+      * латиница/цифры (n8n, Airtable) — замена по границе слова \\b, она тут работает;
+      * кириллица (Манеж, вебхук) — замена подстроки, потому что \\b в Python, как и в JS,
+        не видит границ кириллических слов (см. service-notes/claude-tools.md). Заодно это
+        чинит словоформы: «манеже» → «Манеже», окончание остаётся на месте.
+    """
+    if not text or not terms:
+        return text
+
+    for term in terms:
+        has_cyrillic = bool(re.search(r"[а-яё]", term, re.IGNORECASE))
+        if has_cyrillic:
+            if len(term) < 5:  # слишком короткий корень даст ложные попадания внутри слов
+                continue
+            pattern = re.compile(re.escape(term), re.IGNORECASE)
+        else:
+            pattern = re.compile(r"\b" + re.escape(term) + r"\b", re.IGNORECASE)
+
+        def repl(m, canonical=term):
+            found = m.group(0)
+            if found == canonical:
+                return found
+            # Термин пишется со строчной, а здесь стоит в начале предложения —
+            # не ломаем заглавную букву предложения.
+            if canonical[0].islower() and found[:1].isupper():
+                head = text[: m.start()].rstrip()
+                if not head or head[-1] in ".!?:":
+                    return found
+            return canonical + found[len(canonical):]
+
+        text = pattern.sub(repl, text)
+    return text
+
+
+def _call_normalizer(messages, model, cfg, keys, max_tokens):
+    """Один вызов редактора. Возвращает текст либо None, если модель недоступна."""
+    body = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.1,
+        "max_tokens": max_tokens,
+    }
+    try:
+        res = _groq_post("/chat/completions", keys, json_body=body, timeout=60)
+    except RuntimeError as e:
+        log(f"[warn] модель {model} недоступна: {e}")
+        return None
+    out = (res["choices"][0]["message"]["content"] or "").strip()
+    return out.strip('"').strip() or None
+
+
+def normalize(text, cfg, keys):
+    """
+    Чистка расшифровки быстрой моделью.
+
+    Схема «валидация → один ретрай → откат к сырому»: редактура — ненадёжный шаг,
+    поэтому результат проверяется формальными инвариантами (см. normalization_problems).
+    Нарушение → просим переделать с явным указанием на ошибку. Второй промах → отдаём
+    сырую расшифровку: она хуже причёсана, но точно не искажена.
+    """
+    if not cfg.get("normalize") or not text:
+        return text, "нормализация выключена"
+
+    terms = ", ".join(session_terms(cfg))
+    system = NORMALIZE_SYSTEM.format(terms=terms)
+    # max_tokens впритык: Groq тарифицирует ЗАПРОШЕННЫЕ токены (service-notes/groq.md)
+    max_tokens = min(2000, max(200, int(len(text) / 2) + 200))
+
+    messages = [{"role": "system", "content": system}]
+    for shot_in, shot_out in NORMALIZE_SHOTS:
+        messages.append({"role": "user", "content": shot_in})
+        messages.append({"role": "assistant", "content": shot_out})
+    messages.append({"role": "user", "content": text})
+
+    t0 = time.time()
+    out = _call_normalizer(messages, cfg["normalize_model"], cfg, keys, max_tokens)
+    if out is None:
+        out = _call_normalizer(messages, cfg["normalize_fallback_model"], cfg, keys, max_tokens)
+    if out is None:
+        return text, "сырой (нормализация недоступна)"
+
+    problems = normalization_problems(text, out)
+    if problems:
+        log(f"[warn] редактура нарушила инварианты: {'; '.join(problems)} — переспрашиваю")
+        retry_messages = messages + [
+            {"role": "assistant", "content": out},
+            {
+                "role": "user",
+                "content": (
+                    "Твоя редактура нарушила правила: "
+                    + "; ".join(problems)
+                    + ". Отредактируй исходный текст заново, соблюдая их. "
+                    "Верни только исправленный текст:\n\n" + text
+                ),
+            },
+        ]
+        retry = _call_normalizer(retry_messages, cfg["normalize_model"], cfg, keys, max_tokens)
+        if retry and not normalization_problems(text, retry):
+            log(f"[info] нормализовано со второй попытки за {time.time() - t0:.1f} с")
+            return retry, "нормализовано (со второй попытки)"
+        log("[warn] вторая попытка тоже не прошла проверку — отдаю сырой текст")
+        return text, f"сырой ({problems[0]})"
+
+    log(f"[info] нормализовано за {time.time() - t0:.1f} с")
+    return out, "нормализовано"
+
+
+# --------------------------------------------------------------------------- #
+# Полный конвейер
+# --------------------------------------------------------------------------- #
+
+def process_audio(audio, cfg, keys, on_phase=None):
+    """
+    Аудио -> (итоговый текст, сырая расшифровка, пометка о статусе).
+
+    on_phase("stt"|"edit") вызывается перед каждым сетевым шагом: обе фазы идут
+    по несколько секунд, и без сигнала снаружи индикатор не отличит работу от зависания.
+    """
+    def phase(name):
+        if on_phase:
+            on_phase(name)
+
+    phase("stt")
+    raw = transcribe(audio, cfg, keys)
+    if not raw or is_hallucination(raw):
+        return None, raw, "пусто (тишина или шум)"
+    phase("edit")
+    final, note = normalize(raw, cfg, keys)
+    # Написание терминов чиним детерминированно и ПОСЛЕ модели: так результат
+    # не зависит от того, что решила LLM в этот раз.
+    final = fix_terms_case(final, session_terms(cfg))
+    return final, raw, note
+
+
+def beep(cfg, kind):
+    """Единственная обратная связь во время записи — консоли пользователь не видит."""
+    if not cfg.get("beep", True):
+        return
+    try:
+        import winsound
+
+        tones = {
+            "start": [(880, 90)],
+            "stop": [(660, 70), (440, 70)],
+            "error": [(300, 200)],
+            "empty": [(400, 90), (300, 90)],
+        }
+        for freq, dur in tones.get(kind, []):
+            winsound.Beep(freq, dur)
+    except Exception:  # noqa: BLE001 — beep не должен ронять сценарий
+        pass
