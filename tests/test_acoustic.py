@@ -45,7 +45,7 @@ from voice_once import read_wav  # noqa: E402
 # Второй ищется по двум именам — Windows зовёт HFP-профиль «Головной телефон».
 MICS = [
     ("микрофон ноутбука", ["Internal Microphone"]),
-    ("гарнитура FreeBuds", ["HUAWEI FreeBu", "Головной телефон", "Denis Headphones"]),
+    ("Bluetooth-гарнитура", ["HUAWEI FreeBu", "Головной телефон", "Headset"]),
 ]
 
 results = []
@@ -184,7 +184,7 @@ def test_hotkey_daemon():
               clip != "__ДО_ТЕСТА__" and len(clip) > 10, f"«{clip[:100]}»")
         low = clip.lower()
         check("в буфере именно надиктованное (термины на месте)",
-              "n8n" in low and "манеж" in low, f"«{clip[:100]}»")
+              "n8n" in low and "остгрес" in low, f"«{clip[:100]}»")
         check("текст очищен от слов-паразитов",
               "короче" not in low and "ну и потом" not in low, f"«{clip[:100]}»")
     finally:

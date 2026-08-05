@@ -48,7 +48,10 @@ def check(name, ok, detail=""):
 
 def unit_tests():
     print("\n=== A. Юнит-проверки (без сети) ===")
-    terms = load_glossary()
+    # Список задан здесь, а не взят из glossary.txt: глоссарий у каждого свой и в
+    # репозиторий не выкладывается (там имена проектов и клиентов). Тест, читающий
+    # его, проверял бы чужие настройки и падал бы на любой другой машине.
+    terms = ["n8n", "Airtable", "Postgres", "Постгрес", "Railway", "Whisper"]
 
     check(
         "fix_terms_case: N8n -> n8n",
@@ -56,9 +59,9 @@ def unit_tests():
         fix_terms_case("Посмотри воркфлоу в N8n сейчас", terms),
     )
     check(
-        "fix_terms_case: словоформа «манеже» -> «Манеже»",
-        "Манеже" in fix_terms_case("вебхук в манеже отвалился", terms),
-        fix_terms_case("вебхук в манеже отвалился", terms),
+        "fix_terms_case: кириллическая словоформа «постгресе» -> «Постгресе»",
+        "Постгресе" in fix_terms_case("запрос в постгресе подвисает", terms),
+        fix_terms_case("запрос в постгресе подвисает", terms),
     )
     check(
         "fix_terms_case: не ломает заглавную в начале предложения",
@@ -144,7 +147,11 @@ def e2e_tests():
     final, raw = run_fixture("fixture_ru.wav", cfg, keys)
     low = (final or "").lower()
     check("ru: термин n8n в нижнем регистре", "n8n" in (final or ""), final)
-    check("ru: «Манеж» с заглавной", "Манеж" in (final or ""))
+    # Термин, продиктованный кириллицей, канонизируется по глоссарию — и у кого-то
+    # там «Постгрес», а у кого-то «Postgres». Проверяем, что он доехал, а не в каком
+    # именно алфавите: иначе тест меряет чужие настройки, а не работу конвейера.
+    check("ru: термин «постгрес» доехал в любом написании",
+          "postgres" in low or "остгрес" in (final or ""), final)
     check("ru: Railway распознан", "railway" in low)
     check(
         "ru: императив сохранён (посмотри/сделай, не «посмотрим»)",
