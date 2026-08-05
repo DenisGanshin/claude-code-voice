@@ -49,12 +49,25 @@ MICS = [
 ]
 
 results = []
+skipped = []
 
 
 def check(name, ok, detail=""):
     results.append((name, ok, detail))
     print(f"[{'OK  ' if ok else 'FAIL'}] {name}" + (f" — {detail}" if detail else ""), flush=True)
     return ok
+
+
+def skip(name, why):
+    """
+    Отсутствие железа — не дефект.
+
+    Гарнитура лежит в сумке ровно так же, как она лежит в сумке у любого другого
+    владельца проекта. Красный тест в этом случае обесценивает весь прогон: рядом
+    с ним настоящую поломку перестают замечать.
+    """
+    skipped.append((name, why))
+    print(f"[ПРОП] {name} — {why}", flush=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -67,9 +80,10 @@ def test_capture(label, preferences):
         d for d in list_input_devices()
         if any(p.lower() in d["name"].lower() for p in preferences) and "WDM-KS" not in d["api"]
     ]
-    if not check(f"[{label}] устройство найдено", bool(found),
-                 found[0]["name"] if found else "нет в системе — подключено ли?"):
+    if not found:
+        skip(f"[{label}] захват с устройства", "нет в системе — не подключено")
         return
+    check(f"[{label}] устройство найдено", True, found[0]["name"])
 
     cfg = load_config()
     cfg["input_device_preferences"] = preferences
@@ -183,8 +197,13 @@ def test_hotkey_daemon():
         check("текст попал в буфер обмена",
               clip != "__ДО_ТЕСТА__" and len(clip) > 10, f"«{clip[:100]}»")
         low = clip.lower()
+        # Термин, продиктованный кириллицей, канонизируется по глоссарию — а он у
+        # каждого свой: у кого-то «Постгрес», у кого-то «Postgres». Проверяем, что
+        # термин доехал, а не в каком именно алфавите: иначе тест меряет чужие
+        # настройки, а не работу конвейера.
         check("в буфере именно надиктованное (термины на месте)",
-              "n8n" in low and "остгрес" in low, f"«{clip[:100]}»")
+              "n8n" in low and ("остгрес" in low or "postgres" in low),
+              f"«{clip[:100]}»")
         check("текст очищен от слов-паразитов",
               "короче" not in low and "ну и потом" not in low, f"«{clip[:100]}»")
     finally:
@@ -355,6 +374,9 @@ def main():
     failed = [r for r in results if not r[1]]
     print("\n" + "=" * 60)
     print(f"ИТОГО: {len(results) - len(failed)}/{len(results)} проверок пройдено")
+    if skipped:
+        print(f"ПРОПУЩЕНО: {len(skipped)} — " +
+              "; ".join(f"{n} ({w})" for n, w in skipped))
     for name, _, detail in failed:
         print(f"  - {name}" + (f" — {detail}" if detail else ""))
     print("=" * 60)

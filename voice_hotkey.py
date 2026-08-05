@@ -24,10 +24,7 @@
 import atexit
 import ctypes
 import json
-import math
-import os
 import socket
-import subprocess
 import sys
 import threading
 import time
@@ -38,20 +35,24 @@ import pyperclip
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from voice_core import (  # noqa: E402
-    BASE_DIR,
+    FLASH_TTL_EXTRA,
     KEYS_FILE,
     Recorder,
     beep,
+    clear_recording_state,
+    ensure_overlay,
+    level_from_rms,
     load_config,
     load_groq_keys,
     log,
     process_audio,
+    release_overlay,
     save_recording,
+    set_recording_state,
     write_status,
 )
 
 CONTROL_PORT = 47843  # bind на localhost = защита от второго демона И канал управления
-RECORDING_STATE = BASE_DIR / "_recording.json"  # читает экранный индикатор
 
 COMMANDS = ("toggle", "cancel", "quit", "ping", "state")
 
@@ -124,55 +125,10 @@ def paste_text(text, cfg):
     return "вставлено в активное окно"
 
 
-# --------------------------------------------------------------------------- #
-# Состояние для экранного индикатора
-# --------------------------------------------------------------------------- #
-
-# Сколько состояние остаётся действительным без обновления. Живые фазы демон
-# переписывает постоянно, поэтому им хватает запаса на самый долгий сетевой шаг;
-# «готово»/«ошибка» показываются разово и гаснут сами.
-STATE_TTL_SEC = 120.0
-FLASH_TTL_EXTRA = 0.6
-
-
-def set_recording_state(active, phase="rec", started=None, limit_sec=None,
-                        hint=None, note=None, level=None, quit_overlay=False,
-                        ttl=STATE_TTL_SEC):
-    """
-    Состояние для экранного индикатора. Отдельный процесс читает этот файл.
-
-    Пишем через временный файл и os.replace: во время записи состояние обновляется
-    десять раз в секунду, а индикатор читает тридцать. Обычная перезапись сначала
-    усекает файл и только потом наполняет — в этот зазор читатель видит пустоту.
-    os.replace на одном томе атомарен: читатель видит либо старый файл, либо новый.
-
-    `expires_at` — срок годности состояния. Без него капсула висит на экране вечно,
-    если демон умер между «готово» и отложенным гашением (так и случилось 31.07):
-    гасить было некому, а индикатор верил файлу бесконечно. Теперь состояние
-    протухает само, и живучесть индикатора не зависит от того, как завершился писатель.
-    """
-    tmp = RECORDING_STATE.with_suffix(".tmp")
-    try:
-        tmp.write_text(json.dumps({
-            "active": bool(active),
-            "phase": phase,
-            "started": started,
-            "limit_sec": limit_sec,
-            "hint": hint,
-            "note": note,
-            "level": level,
-            "quit": quit_overlay,
-            "expires_at": (time.time() + ttl) if (active and ttl) else None,
-        }, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, RECORDING_STATE)
-    except OSError:
-        pass
-
-
-def clear_recording_state():
-    """Гасит индикатор. Вызывается и при штатном выходе демона, и из atexit."""
-    set_recording_state(False)
-
+# Индикатор записи (файл состояния, запуск окна, шкала громкости) живёт в
+# voice_core: микрофон открывает ядро, и капсулу поднимает оно же — иначе
+# требование «скрытых записей быть не должно» держалось бы только для хоткея,
+# а /voice и ask.py писали бы молча.
 
 VK_CAPITAL = 0x14
 
@@ -180,19 +136,6 @@ VK_CAPITAL = 0x14
 def capslock_on():
     """Младший бит GetKeyState у переключателей — это состояние «залипания», не нажатие."""
     return bool(ctypes.windll.user32.GetKeyState(VK_CAPITAL) & 1)
-
-
-def level_from_rms(rms):
-    """
-    Громкость в шкалу 0..1 для столбиков индикатора.
-
-    По децибелам, а не линейно: слух логарифмичен, и на линейной шкале обычная речь
-    (RMS около 0.05) даёт едва заметный столбик, а вся видимая часть достаётся крику.
-    """
-    if rms <= 1e-6:
-        return 0.0
-    db = 20 * math.log10(rms)
-    return max(0.0, min(1.0, (db + 55) / 45))  # -55 дБ — тишина, -10 дБ — максимум
 
 
 class Daemon:
@@ -331,33 +274,18 @@ class Daemon:
 
     def start_overlay(self):
         """
-        Индикатор — отдельный процесс: tkinter требует свой главный цикл, а демон
-        в это время занят записью и сетью. Связь через файл состояния.
+        Поднять окно индикатора на всё время жизни демона.
+
+        Гасим состояние ПЕРЕД запуском: в файле мог остаться хвост от прошлого
+        запуска, и свежий индикатор нарисовал бы капсулу над несуществующей записью.
         """
-        if not self.cfg.get("show_overlay", True):
-            return
-        set_recording_state(False)
-        script = BASE_DIR / "overlay.py"
-        if not script.exists():
-            return
-        try:
-            pythonw = Path(sys.executable).with_name("pythonw.exe")
-            exe = str(pythonw) if pythonw.exists() else sys.executable
-            self.overlay = subprocess.Popen(
-                [exe, str(script)], cwd=str(BASE_DIR),
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-        except OSError as e:
-            log(f"[warn] индикатор не запустился: {e}")
+        clear_recording_state()
+        self.overlay = ensure_overlay(self.cfg)
 
     def stop_overlay(self):
-        set_recording_state(False, quit_overlay=True)
-        if self.overlay is None:
-            return
-        try:
-            self.overlay.wait(timeout=3)
-        except Exception:  # noqa: BLE001
-            self.overlay.kill()
+        # force: демон — резидент, на выходе окно закрывается целиком, даже если
+        # его рисует индикатор, оставшийся от прошлого запуска.
+        release_overlay(force=True)
 
     def set_lamp(self, on):
         """

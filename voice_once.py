@@ -25,6 +25,7 @@ from voice_core import (  # noqa: E402
     KEYS_FILE,
     Recorder,
     beep,
+    clear_recording_state,
     list_input_devices,
     load_config,
     load_groq_keys,
@@ -32,6 +33,7 @@ from voice_core import (  # noqa: E402
     process_audio,
     resample_to_16k,
     save_recording,
+    set_recording_state,
     write_status,
 )
 
@@ -75,6 +77,7 @@ def main():
         print("(ошибка: не найден ключ Groq — голосовой ввод не настроен)")
         return 2
 
+    recorded = None
     if args.file:
         audio = read_wav(args.file)
         log(f"[info] файл {args.file}: {len(audio) / 16000:.1f} с")
@@ -82,33 +85,53 @@ def main():
         rec = Recorder(cfg)
         log(f"[info] микрофон: {rec.device_name}")
         write_status(f"старт записи, устройство: {rec.device_name}")
+        # Капсулу поднимает и гасит сам Recorder — от факта открытия потока.
         audio = rec.record_auto(on_ready=lambda: (beep(cfg, "start"), log("[info] ГОВОРИТЕ…")))
         if audio is None:
             beep(cfg, "empty")
             write_status("тишина, записи не было")
             print("(тишина: речь не распознана, повторите /voice)")
             return 1
+        # Фазу ставим ПЕРВЫМ делом после записи, до сигнала и сохранения: beep
+        # блокирует поток на 140 мс, и капсула успела бы заметно мигнуть между
+        # «пишу» и «расшифровываю».
+        recorded = f"записано {len(audio) / 16000:.1f} с"
+        set_recording_state(True, phase="stt", note=recorded)
         beep(cfg, "stop")
-        log(f"[info] записано {len(audio) / 16000:.1f} с")
-        write_status(f"записано {len(audio) / 16000:.1f} с, распознаю")
+        log(f"[info] {recorded}")
+        write_status(f"{recorded}, распознаю")
         save_recording(audio, cfg, prefix="voice")  # до облака: сбой не должен стоить диктовки
 
+    # Фазы показываем только если запись делали мы. В режиме `--file` микрофон не
+    # открывался, капсула нам не принадлежит — и гасить её нельзя: её может держать
+    # работающий рядом демон.
+    def on_phase(p):
+        set_recording_state(True, phase=p, note=recorded)
+
+    def done():
+        if recorded:
+            clear_recording_state()
+
     try:
-        final, raw, note = process_audio(audio, cfg, keys)
+        final, raw, note = process_audio(audio, cfg, keys,
+                                         on_phase=on_phase if recorded else None)
     except RuntimeError as e:
         log(f"[error] {e}")
         beep(cfg, "error")
+        done()
         print(f"(ошибка распознавания: {e})")
         return 3
 
     if not final:
         beep(cfg, "empty")
         write_status("пустой результат")
+        done()
         print("(тишина: речь не распознана, повторите /voice)")
         return 1
 
     log(f"[info] статус: {note}")
     write_status(f"готово: {len(final)} симв. ({note})")
+    done()
     if args.show_raw and raw != final:
         log(f"[raw] {raw}")
     print(final)
