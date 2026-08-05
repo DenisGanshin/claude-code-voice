@@ -9,6 +9,8 @@
   "cancel_hotkey": "alt+x",
   "quit_hotkey": "ctrl+alt+q",
   "show_overlay": true,
+  "overlay_position": "top-center",
+  "overlay_margin_px": 12,
   "keep_recordings": true,
   "recordings_dir": "_recordings",
   "recordings_ttl_hours": 24,

@@ -34,6 +34,7 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 BASE = Path(__file__).resolve().parent
 STATE_FILE = BASE / "_recording.json"
+CONFIG_FILE = BASE / "config.json"
 
 # --------------------------------------------------------------------------- #
 # Оформление
@@ -43,7 +44,12 @@ SS = 3                      # во сколько раз крупнее рису
 CANVAS = (400, 106)         # холст: капсула + место под тень
 PILL = (12, 8, 388, 78)     # сама капсула, 376x70
 RADIUS = 35
-MARGIN_TOP = 12             # отступ от верхней кромки экрана
+# Холст шире капсулы — по краям запас под тень. Отступ считаем от КАПСУЛЫ, а не от
+# холста: иначе «12 пикселей от края» внизу превратились бы в 40, потому что снизу
+# запаса под тень больше, чем сверху.
+PILL_INSET = (PILL[0], PILL[1], CANVAS[0] - PILL[2], CANVAS[1] - PILL[3])
+DEFAULT_POSITION = "top-center"
+DEFAULT_MARGIN = 12         # отступ от кромки рабочей области
 DOT = (36, 43, 6.0)         # индикатор состояния: центр и радиус
 ROW1, ROW2, TEXT_X = 31, 55, 56
 LIMIT_LINE = (56, 356, 67, 2.5)  # нить лимита: слева, справа, верх, толщина
@@ -109,6 +115,33 @@ def canvas_px():
 
 setup_scale()  # значения по умолчанию, чтобы модуль можно было импортировать
 
+
+def load_placement(config_file=CONFIG_FILE):
+    """
+    Где висеть капсуле: (вертикаль, горизонталь, отступ).
+
+    Читаем config.json напрямую, а не через voice_core: индикатор — отдельный
+    процесс, и тянуть ради двух чисел sounddevice с requests значит платить
+    полсекунды на старте и держать в памяти звуковой стек, который здесь не нужен.
+
+    Любое непонятное значение молча превращается в положение по умолчанию:
+    опечатка в конфиге не повод остаться без индикатора записи.
+    """
+    position, margin = DEFAULT_POSITION, DEFAULT_MARGIN
+    try:
+        cfg = json.loads(config_file.read_text(encoding="utf-8"))
+        position = str(cfg.get("overlay_position") or position).strip().lower()
+        margin = float(cfg.get("overlay_margin_px", margin))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        pass
+    vertical, _, horizontal = position.partition("-")
+    if vertical not in ("top", "bottom"):
+        vertical = "top"
+    if horizontal not in ("left", "center", "right"):
+        horizontal = "center"
+    return vertical, horizontal, max(0.0, margin)
+
+
 PHASES = {
     "stt": ("расшифровываю", C_WORK),
     "edit": ("привожу в порядок", C_WORK),
@@ -159,6 +192,32 @@ class SIZE(ctypes.Structure):
 
 class POINT(ctypes.Structure):
     _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+
+
+class RECT(ctypes.Structure):
+    _fields_ = [("left", wintypes.LONG), ("top", wintypes.LONG),
+                ("right", wintypes.LONG), ("bottom", wintypes.LONG)]
+
+
+SPI_GETWORKAREA = 0x0030
+
+
+def work_area():
+    """
+    Область экрана без панели задач — (лево, верх, право, низ) в физических пикселях.
+
+    Полный экран здесь не годится: панель задач по умолчанию стоит внизу, и капсула,
+    поставленная «внизу по центру», оказалась бы наполовину под ней. Работает это
+    только потому, что процесс объявлен DPI-осведомлённым: до объявления система
+    отдала бы логические координаты, а рисуем мы в физических.
+    """
+    rect = RECT()
+    try:
+        if user32.SystemParametersInfoW(SPI_GETWORKAREA, 0, ctypes.byref(rect), 0):
+            return rect.left, rect.top, rect.right, rect.bottom
+    except Exception:  # noqa: BLE001 — не ответила система, берём весь экран
+        pass
+    return 0, 0, user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
 
 
 class BLENDFUNCTION(ctypes.Structure):
@@ -218,6 +277,9 @@ def _declare():
     user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int,
                                     ctypes.c_int, ctypes.c_int, ctypes.c_int,
                                     wintypes.UINT]
+    user32.SystemParametersInfoW.restype = wintypes.BOOL
+    user32.SystemParametersInfoW.argtypes = [wintypes.UINT, wintypes.UINT,
+                                             wintypes.LPVOID, wintypes.UINT]
     ctypes.windll.kernel32.GetModuleHandleW.restype = wintypes.HMODULE
     ctypes.windll.kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
 
@@ -462,7 +524,48 @@ class Indicator:
         self.alpha = 0.0
         self.started_at = time.time()
         self.last_top = 0.0
-        self.screen_w = user32.GetSystemMetrics(0)
+        self.hidden = True   # чтобы положение перечиталось перед первым показом
+        self.vertical, self.horizontal, self.margin = load_placement()
+        self.work = work_area()
+
+    def refresh_placement(self):
+        """
+        Перечитать положение перед показом капсулы.
+
+        Раз в появление, а не раз в кадр: тридцать чтений файла в секунду ради
+        настройки, которую меняют раз в год, — плата ни за что. Но и раз в запуск
+        мало: индикатор живёт неделями вместе с демоном, и правка config.json
+        иначе не действовала бы до перезагрузки. Заодно обновляем рабочую область —
+        она меняется от подключённого монитора и переехавшей панели задач.
+        """
+        self.vertical, self.horizontal, self.margin = load_placement()
+        self.work = work_area()
+
+    def placement(self, offset):
+        """
+        Левый верхний угол холста. `offset` — смещение анимации появления.
+
+        Капсула выезжает со СВОЕЙ стороны экрана: сверху — сверху, снизу — снизу.
+        Движение считывается быстрее изменения яркости, но только если направлено
+        оттуда, откуда предмет приходит; выезжающая вверх нижняя капсула читается
+        как сбой отрисовки.
+        """
+        left, top, right, bottom = self.work
+        cw, ch = self.canvas
+        m = self.margin * UI
+
+        if self.horizontal == "left":
+            x = left + m - PILL_INSET[0] * UI
+        elif self.horizontal == "right":
+            x = right - cw - m + PILL_INSET[2] * UI
+        else:
+            x = left + (right - left - cw) / 2
+
+        if self.vertical == "bottom":
+            y = bottom - ch - m + PILL_INSET[3] * UI + offset
+        else:
+            y = top + m - PILL_INSET[1] * UI - offset
+        return int(round(x)), int(round(y))
 
     # -- состояние ----------------------------------------------------------- #
 
@@ -560,16 +663,20 @@ class Indicator:
 
             if self.alpha <= 0.01:
                 self.win.hide()
+                self.hidden = True
                 time.sleep(0.1)          # индикатор молчит — не жечь процессор
                 continue
 
+            if self.hidden:
+                self.refresh_placement()
+                self.hidden = False
+
             state = self.build(raw)
             img = render(state)
-            # При появлении капсула чуть выезжает сверху — движение считывается
-            # быстрее, чем изменение яркости.
+            # При появлении капсула чуть выезжает из-за края экрана — движение
+            # считывается быстрее, чем изменение яркости.
             offset = int((1.0 - self.alpha) * 10 * UI)
-            self.win.blit(img, (self.screen_w - self.canvas[0]) // 2,
-                          round((MARGIN_TOP - 8) * UI) - offset, self.alpha)
+            self.win.blit(img, *self.placement(offset), alpha=self.alpha)
             self.win.show()
 
             now = time.time()

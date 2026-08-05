@@ -31,11 +31,13 @@ from speak_core import VOICES, load_tts_config, say  # noqa: E402
 from voice_core import (  # noqa: E402
     Recorder,
     beep,
+    clear_recording_state,
     load_groq_keys,
     log,
     match_option,
     process_audio,
     save_recording,
+    set_recording_state,
     write_status,
 )
 
@@ -96,6 +98,9 @@ def main():
 
     rec = Recorder(cfg)
     log(f"[info] слушаю ответ, микрофон: {rec.device_name}")
+    # Капсулу поднимает и гасит сам Recorder — от факта открытия потока. Здесь это
+    # особенно важно: вопрос задан голосом, человек мог отойти от экрана и вернуться
+    # к уже открытому микрофону, о котором на экране не было бы ни следа.
     audio = rec.record_auto(on_ready=lambda: (beep(cfg, "start"), log("[info] ГОВОРИТЕ…")))
     if audio is None:
         beep(cfg, "empty")
@@ -103,16 +108,24 @@ def main():
         print("(нет ответа: тишина)")
         return 1
 
+    # Фаза — до сигнала: beep блокирует поток на 140 мс, и капсула мигнула бы.
+    recorded = f"записано {len(audio) / 16000:.1f} с"
+    set_recording_state(True, phase="stt", note=recorded)
     beep(cfg, "stop")
     write_status(f"ответ записан, {len(audio) / 16000:.1f} с")
     save_recording(audio, cfg, prefix="answer")
     try:
-        final, _raw, note = process_audio(audio, cfg, keys)
+        final, _raw, note = process_audio(
+            audio, cfg, keys,
+            on_phase=lambda p: set_recording_state(True, phase=p, note=recorded),
+        )
     except RuntimeError as e:
         log(f"[error] {e}")
+        clear_recording_state()
         print(f"(ошибка распознавания: {e})")
         return 3
 
+    clear_recording_state()
     if not final:
         print("(нет ответа: речь не распознана)")
         return 1
