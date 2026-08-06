@@ -36,6 +36,7 @@ import socket
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 
 import keyboard
@@ -67,6 +68,39 @@ from voice_core import (  # noqa: E402
 CONTROL_PORT = 47843  # bind на localhost = защита от второго демона И канал управления
 
 COMMANDS = ("toggle", "cancel", "quit", "ping", "state")
+
+
+def log_crash(where, exc=None):
+    """
+    Записать необработанное исключение в лог — иначе о нём не узнает никто.
+
+    Демон живёт под `pythonw`, у которого нет ни консоли, ни stderr: трейсбек
+    необработанного исключения уходит в никуда, процесс тихо исчезает, и
+    единственный след — оборвавшийся лог. Так и случилось 06.08: после ошибки
+    открытия микрофона демон умер, а в логе не оказалось даже строки «демон
+    остановлен» — только тишина, по которой причину не восстановить.
+
+    Логирование, которое зависит от того, куда смотрит stderr, — это
+    логирование, которого нет.
+    """
+    text = traceback.format_exc() if exc is None else "".join(
+        traceback.format_exception(type(exc), exc, exc.__traceback__))
+    log(f"[CRASH] {where}")
+    for line in text.rstrip().splitlines():
+        log(f"    {line}")
+
+
+def install_crash_logging():
+    """Перехват для главного потока и для всех остальных."""
+    def hook(exc_type, exc, tb):
+        log_crash("необработанное исключение", exc)
+
+    sys.excepthook = hook
+    if hasattr(threading, "excepthook"):
+        def thread_hook(args):
+            log_crash(f"исключение в потоке {args.thread.name}", args.exc_value)
+
+        threading.excepthook = thread_hook
 
 
 def ensure_single_instance():
@@ -361,7 +395,18 @@ class Daemon:
             if self.quit.is_set():
                 break
             self.cancel.clear()
-            self._session()
+            try:
+                self._session()
+            except Exception:  # noqa: BLE001
+                # Резидент не имеет права умирать от одной неудачной записи.
+                # 06.08 демон исчез после «микрофон недоступен», и дальше
+                # CapsLock не делал ничего — а понять это можно было только
+                # по тому, что лог оборвался на полуслове.
+                log_crash("сессия записи упала — демон продолжает работать")
+                self.recording = False
+                self.busy = False
+                self.set_lamp(False)
+                self.flash("error", "сбой записи, см. лог", seconds=3.0)
 
         self.set_lamp(False)  # выход на ходу не должен оставить включённый CapsLock
         self.stop_overlay()
@@ -543,7 +588,12 @@ class Daemon:
         try:
             rec.start(on_ready=lambda: (beep(self.cfg, "start"), log("[rec] пишу…")))
         except Exception as e:  # noqa: BLE001
-            log(f"[error] микрофон недоступен: {e}")
+            # С трейсбеком, а не одной строкой: этот except накрывает весь старт
+            # записи — выбор устройства, прогрев, калибровку, сигнал готовности.
+            # 06.08 сюда прилетело «[Errno 22] Invalid argument», и по одному
+            # тексту место было не определить: судя по логу, прогрев успел
+            # завершиться, то есть упало уже после него.
+            log_crash(f"старт записи не удался: {e}", e)
             beep(self.cfg, "error")
             self.recording = False
             self.set_lamp(False)
@@ -712,11 +762,15 @@ def main():
     # Индикатор — отдельный процесс и переживает демона. Если тот уйдёт, не погасив
     # состояние (Ctrl+C, закрытое окно, падение), капсула останется висеть на экране.
     atexit.register(clear_recording_state)
+    install_crash_logging()
     try:
         return Daemon(overrides).run(lock)
     except KeyboardInterrupt:
         log("\n[info] прервано пользователем")
         return 0
+    except Exception:  # noqa: BLE001 — иначе выход тихий, см. log_crash
+        log_crash("демон упал в главном цикле")
+        return 3
     finally:
         clear_recording_state()
         lock.close()
