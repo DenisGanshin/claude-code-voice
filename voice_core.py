@@ -54,7 +54,7 @@ def keys_file():
     3. `keys.local` на два уровня выше — раскладка рабочего каталога Claude Code
        (`<корень>/projects/<проект>/voice-input`), где ключи общие на все проекты.
 
-    Раньше здесь стоял абсолютный путь `D:/Claude/keys.local`. Для одной машины это
+    Раньше здесь стоял абсолютный путь к `keys.local`. Для одной машины это
     работало, но делало проект непереносимым: на чужом компьютере ключи не находятся
     вовсе, а сообщение об ошибке называет каталог, которого у человека нет.
     """
@@ -72,6 +72,10 @@ CONFIG_FILE = BASE_DIR / "config.json"
 GLOSSARY_FILE = BASE_DIR / "glossary.txt"
 STATUS_FILE = BASE_DIR / "_last_run.status"
 RECORDING_STATE = BASE_DIR / "_recording.json"  # читает экранный индикатор
+# Последняя расшифровка отдельным файлом, а не поиском по истории: её достают в
+# момент, когда текст уже потерян, и разбирать разметку тогда — лишний шанс
+# ошибиться. История ниже (_transcripts/) для человека, этот файл — для машины.
+LAST_TRANSCRIPT = BASE_DIR / "_last_transcript.txt"
 
 GROQ_BASE = "https://api.groq.com/openai/v1"
 SAMPLE_RATE = 16000  # Whisper всё равно работает на 16 кГц
@@ -102,6 +106,12 @@ DEFAULT_CONFIG = {
     "keep_recordings": True,       # сохранять аудио до отправки в облако
     "recordings_dir": "_recordings",
     "recordings_ttl_hours": 24,
+    # Текст диктовки на диск. Аудио уже сохраняется, но чтобы достать из него
+    # текст, нужен ключ, сеть и живой Groq, — а пропажу замечают как раз тогда,
+    # когда что-то из этого недоступно. Текст весит копейки и достаётся сразу.
+    "keep_transcripts": True,
+    "transcripts_dir": "_transcripts",
+    "transcripts_ttl_days": 30,    # месяц: аудио живёт сутки, текст дешевле хранить
     "language": "ru",
     "stt_model": "whisper-large-v3-turbo",
     "normalize": True,
@@ -249,7 +259,7 @@ _overlay_atexit_done = False
 
 def set_recording_state(active, phase="rec", started=None, limit_sec=None,
                         hint=None, note=None, level=None, quit_overlay=False,
-                        ttl=None):
+                        ttl=None, fake=False):
     """
     Состояние для экранного индикатора. Отдельный процесс читает этот файл.
 
@@ -265,6 +275,12 @@ def set_recording_state(active, phase="rec", started=None, limit_sec=None,
 
     Срок по умолчанию зависит от фазы: запись переписывается постоянно и живёт
     коротко, остальные фазы пишутся разово и ждут ответа сети (см. REC_TTL_SEC).
+
+    `fake` — звук идёт из подставного файла, а не с микрофона. Капсула обязана
+    выглядеть иначе: индикатор, который показывает запись там, где микрофон не
+    открывался, обесценивает себя и в настоящем случае. Инцидент 2026-08-06:
+    автотест с `--fake-mic` поднял на экране обычную красную капсулу, и со
+    стороны это было неотличимо от того, что человека пишут.
     """
     if ttl is None:
         ttl = REC_TTL_SEC if phase == "rec" else STATE_TTL_SEC
@@ -278,6 +294,7 @@ def set_recording_state(active, phase="rec", started=None, limit_sec=None,
             "hint": hint,
             "note": note,
             "level": level,
+            "fake": bool(fake),
             "quit": quit_overlay,
             "expires_at": (time.time() + ttl) if (active and ttl) else None,
         }, ensure_ascii=False), encoding="utf-8")
@@ -860,7 +877,7 @@ class Recorder:
             True, phase="rec", started=self._indicator_started,
             limit_sec=self._limit_sec,
             hint=(self.device_name or "").split(" [")[0],
-            level=level,
+            level=level, fake=bool(self.fake_wav),
         )
 
     def _lower_indicator(self):
@@ -1291,6 +1308,67 @@ def save_recording(audio, cfg, prefix="rec"):
     except OSError as e:
         log(f"[warn] не удалось сохранить запись: {e}")
         return None
+
+
+def cleanup_transcripts(folder, ttl_days):
+    """Удаляет дневные файлы истории старше TTL. Возвращает, сколько убрал."""
+    if ttl_days <= 0:
+        return 0
+    deadline = time.time() - ttl_days * 86400
+    removed = 0
+    for path in folder.glob("*.md"):
+        try:
+            if path.stat().st_mtime < deadline:
+                path.unlink()
+                removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def save_transcript(text, cfg, source="hotkey", note=None):
+    """
+    Кладёт готовый текст на диск: в историю за день и в файл «последняя».
+
+    Зачем отдельно от аудио: до 2026-08-06 полный текст не хранился нигде —
+    в логе оставались первые 120 символов, а восстановить остальное можно было
+    только повторным прогоном WAV через облако, и то в пределах суток. Диктовка
+    на пять минут — это пять минут работы человека, и она не должна зависеть от
+    того, доживёт ли запись до момента, когда пропажу заметят.
+
+    Пишем ПОСЛЕ вставки, но независимо от её успеха: файл нужен ровно в том
+    случае, когда вставка не удалась.
+    """
+    if not text or not cfg.get("keep_transcripts", True):
+        return None
+    folder = BASE_DIR / cfg.get("transcripts_dir", "_transcripts")
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        # «Последняя» — первой: она и есть страховка, а история приятное дополнение.
+        # Если на записи истории что-то сломается, текст всё равно уже спасён.
+        LAST_TRANSCRIPT.write_text(text, encoding="utf-8")
+    except OSError as e:
+        log(f"[warn] не удалось сохранить последнюю расшифровку: {e}")
+    try:
+        folder.mkdir(exist_ok=True)
+        cleanup_transcripts(folder, float(cfg.get("transcripts_ttl_days", 30)))
+        path = folder / f"{time.strftime('%Y-%m-%d')}.md"
+        head = f"## {stamp} · {source}" + (f" · {note}" if note else "")
+        with path.open("a", encoding="utf-8") as f:
+            f.write(f"{head}\n\n{text}\n\n")
+        return path
+    except OSError as e:
+        log(f"[warn] не удалось записать историю расшифровок: {e}")
+        return None
+
+
+def last_transcript():
+    """Последняя расшифровка или None. Демон для этого не нужен — читаем файл."""
+    try:
+        text = LAST_TRANSCRIPT.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    return text or None
 
 
 def audio_to_wav_bytes(audio, sr=SAMPLE_RATE):

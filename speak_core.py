@@ -33,7 +33,7 @@ DEFAULT_TTS = {
     "eleven_voice": "artem",
     "eleven_model": "quality",           # quality | turbo | flash
     "eleven_settings": {"stability": 0.5, "similarity_boost": 0.75, "style": 0.0},
-    "piper_voice": "irina",              # irina | denis | ruslan | dmitri
+    "piper_voice": "irina",   # irina | denis | ruslan | dmitri — audit: ok имена моделей Piper
     "tts_voice": "ru-RU-DmitryNeural",   # голос edge-tts
     "tts_rate": "+8%",          # чуть быстрее нейтрального: так речь звучит деловито
     "tts_volume": "+0%",

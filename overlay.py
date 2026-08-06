@@ -146,6 +146,10 @@ PHASES = {
     "stt": ("расшифровываю", C_WORK),
     "edit": ("привожу в порядок", C_WORK),
     "done": ("готово", C_OK),
+    # Не ошибка и не успех: текст цел, но лежит в буфере и ждёт Ctrl+V. Отдельная
+    # фаза, потому что зелёное «готово» здесь соврало бы, а красная «ошибка»
+    # заставила бы искать поломку там, где ничего не сломалось.
+    "clipboard": ("текст в буфере", C_WARN),
     "error": ("ошибка", C_REC),
     "cancel": ("отменено", C_DIM),
 }
@@ -634,8 +638,16 @@ class Indicator:
             target = float(raw.get("level") or 0.0)
             self.level = self.level + (target - self.level) * 0.5
             self.levels.append(self.level)
-            accent = C_WARN if ratio > 0.8 else C_REC
-            title, sub = "", raw.get("hint") or ""
+            # Подставной источник — серым и с явной подписью. Красная капсула
+            # означает «вас пишут», и означать это она должна ВСЕГДА: индикатор,
+            # которому можно не поверить в одну сторону, не работает и в другую
+            # (инцидент 2026-08-06 — автотест с --fake-mic выглядел как запись).
+            if raw.get("fake"):
+                accent = C_DIM
+                title, sub = "", (raw.get("hint") or "подставной файл")
+            else:
+                accent = C_WARN if ratio > 0.8 else C_REC
+                title, sub = "", raw.get("hint") or ""
         else:
             title, accent = PHASES.get(raw.get("phase"), ("работаю", C_WORK))
             sub = raw.get("note") or ""

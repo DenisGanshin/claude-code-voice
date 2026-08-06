@@ -9,7 +9,14 @@
   Ctrl+Alt+Q — выход из демона.
 
 Работает в любом окне: Claude Code, браузер, редактор. Текст вставляется через
-буфер обмена (Ctrl+V), прежнее содержимое буфера восстанавливается.
+буфер обмена (Ctrl+V) в то окно, из которого начали диктовать; прежнее содержимое
+буфера восстанавливается. Если за время распознавания фокус ушёл в другое окно,
+вставки НЕ будет: текст останется в буфере, а капсула скажет нажать Ctrl+V.
+
+Полный текст каждой диктовки пишется в _transcripts/ и живёт 30 дней. Вернуть
+последнюю в буфер обмена, если она всё-таки потерялась:
+
+    python voice_hotkey.py --last
 
 Тем же самым управляют по сокету, не трогая клавиатуру:
 
@@ -23,6 +30,7 @@
 
 import atexit
 import ctypes
+import ctypes.wintypes  # подмодуль не подтягивается сам импортом ctypes
 import json
 import socket
 import sys
@@ -41,6 +49,7 @@ from voice_core import (  # noqa: E402
     beep,
     clear_recording_state,
     ensure_overlay,
+    last_transcript,
     level_from_rms,
     load_config,
     load_groq_keys,
@@ -48,6 +57,7 @@ from voice_core import (  # noqa: E402
     process_audio,
     release_overlay,
     save_recording,
+    save_transcript,
     set_recording_state,
     write_status,
 )
@@ -91,8 +101,81 @@ def send_command(command, timeout=3.0):
             return ""
 
 
-def paste_text(text, cfg):
-    """Вставка в активное окно с восстановлением прежнего буфера обмена."""
+user32 = ctypes.windll.user32
+# Без явного restype ctypes считает результат 32-битным int, и на x64 старшая
+# половина хэндла молча отваливается. Сравнение окон тогда врёт в обе стороны:
+# разные окна выглядят одинаковыми, одно и то же — разными.
+user32.GetForegroundWindow.restype = ctypes.wintypes.HWND
+user32.IsWindow.argtypes = [ctypes.wintypes.HWND]
+user32.GetWindowTextW.argtypes = [ctypes.wintypes.HWND, ctypes.wintypes.LPWSTR,
+                                  ctypes.c_int]
+
+
+def foreground_window():
+    """Хэндл активного окна; 0 — если система его не отдала."""
+    try:
+        return int(user32.GetForegroundWindow() or 0)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def window_title(hwnd, limit=40):
+    """Заголовок окна — только чтобы человеку было понятно, куда уехал фокус."""
+    if not hwnd:
+        return ""
+    try:
+        buf = ctypes.create_unicode_buffer(256)
+        user32.GetWindowTextW(ctypes.wintypes.HWND(hwnd), buf, 256)
+        title = buf.value.strip()
+    except Exception:  # noqa: BLE001
+        return ""
+    return title[:limit] + "…" if len(title) > limit else title
+
+
+def focus_moved(target):
+    """
+    Ушёл ли фокус из окна, в котором начали диктовать.
+
+    Возвращает None, если всё на месте, иначе описание того, где фокус сейчас, —
+    его показываем человеку, чтобы «не вставилось» не выглядело поломкой.
+    """
+    if not target:
+        return None  # окно старта неизвестно — вести себя как раньше
+    try:
+        if not user32.IsWindow(ctypes.wintypes.HWND(target)):
+            return "окно закрыто"
+        current = foreground_window()
+    except Exception:  # noqa: BLE001
+        return None  # проверка сломалась — не она повод не вставлять текст
+    if current == target:
+        return None
+    return window_title(current) or "другое окно"
+
+
+def paste_text(text, cfg, target=None):
+    """
+    Вставка в то окно, из которого начали диктовать.
+
+    Возвращает (описание, исход), где исход — один из:
+      "pasted"     текст ушёл в то самое окно;
+      "clipboard"  штатно оставлен в буфере (авто-вставка выключена);
+      "lost"       фокус сменился, вставка отменена, текст ждёт в буфере.
+
+    Три исхода, а не «получилось/нет»: выключенная авто-вставка и уехавший фокус
+    оба оставляют текст в буфере, но первое — это то, о чём человек просил, а
+    второе — то, о чём он обязан узнать.
+
+    Почему сверяем окно (жалоба 2026-08-06). Между «стоп» и вставкой проходит
+    распознавание — на длинной диктовке это несколько секунд, и всё это время
+    человек волен переключиться. `keyboard.send` адресует не окно, а систему:
+    текст уходит туда, где фокус СЕЙЧАС. Хуже того, следом буфер восстанавливался
+    на прежнее содержимое — и диктовка пропадала целиком. Чем длиннее запись, тем
+    шире это окно и тем дороже потеря.
+
+    Фокус обратно не отбираем намеренно: человек переключился по своей воле и,
+    возможно, уже печатает в другом окне. Текст остаётся в буфере — это
+    восстановимо одним Ctrl+V, в отличие от нажатий, уехавших не туда.
+    """
     try:
         previous = pyperclip.paste()
     except Exception:  # noqa: BLE001
@@ -100,7 +183,7 @@ def paste_text(text, cfg):
 
     pyperclip.copy(text)
     if not cfg.get("auto_paste", True):
-        return "в буфере обмена (авто-вставка выключена)"
+        return "в буфере обмена (авто-вставка выключена)", "clipboard"
 
     # Пользователь ещё может удерживать модификаторы хоткея — иначе Ctrl+Alt+V
     # уедет в приложение как другое сочетание.
@@ -110,7 +193,19 @@ def paste_text(text, cfg):
             keyboard.release(mod)
         except Exception:  # noqa: BLE001
             pass
+
+    # Сверка ПОСЛЕ паузы, а не до: четверть секунды — тоже время, за которое
+    # успевает сработать Alt+Tab.
+    moved = focus_moved(target)
+    if moved:
+        return f"фокус ушёл в «{moved}» — текст в буфере, нажмите Ctrl+V", "lost"
+
     keyboard.send("ctrl+v")
+
+    # И ещё раз — уже после нажатия. Окно могло смениться в тот же миг; тогда
+    # текст, возможно, не дошёл, и затирать им буфер нельзя.
+    if focus_moved(target):
+        return "фокус сменился при вставке — текст в буфере, нажмите Ctrl+V", "lost"
 
     if previous is not None:
         def restore():
@@ -122,7 +217,7 @@ def paste_text(text, cfg):
                 pass
 
         threading.Thread(target=restore, daemon=True).start()
-    return "вставлено в активное окно"
+    return "вставлено в активное окно", "pasted"
 
 
 # Индикатор записи (файл состояния, запуск окна, шкала громкости) живёт в
@@ -386,6 +481,10 @@ class Daemon:
         # уже горит (её зажгла Windows на нажатие), и сторож обязан считать это
         # правдой, а не гасить её на те доли секунды, что длится старт.
         self.recording = True
+        # Окно-адресат — прямо сейчас, пока фокус ещё там, откуда нажали хоткей.
+        # Позже он уже не показатель: между стопом и вставкой человек успевает
+        # переключиться, и без этого снимка вставка уходит в чужое окно.
+        target = foreground_window()
         rec = Recorder(self.cfg)
         limit = float(self.cfg.get("max_record_sec", 600))
         # Отсчёт — от нажатия, а не от готовности потока: иначе таймер на индикаторе
@@ -409,9 +508,11 @@ class Daemon:
         write_status(f"запись, устройство: {rec.device_name}")
         device = rec.device_name.split(" [")[0]
 
+        fake = bool(rec.fake_wav)  # звук из файла: капсула обязана это показать
+
         def show(level=0.0):
             set_recording_state(True, phase="rec", started=started, limit_sec=limit,
-                                hint=device, level=level)
+                                hint=device, level=level, fake=fake)
 
         show()
         while not self.toggle.is_set() and not self.quit.is_set():
@@ -475,11 +576,20 @@ class Daemon:
             self.flash("cancel", "речь не распознана")
             return
 
-        where = paste_text(final, self.cfg)
+        where, outcome = paste_text(final, self.cfg, target)
+        # Текст на диск — независимо от того, дошёл он до поля ввода. Файл нужен
+        # ровно в том случае, когда не дошёл.
+        save_transcript(final, self.cfg, source="hotkey", note=where)
         log(f"[ok] {note}; {where}")
         log(f"     «{final[:120]}{'…' if len(final) > 120 else ''}»")
         write_status(f"готово: {len(final)} симв., {where}")
-        self.flash("done", where)
+        if outcome != "lost":
+            self.flash("done", where)
+            return
+        # Не дошло: текст цел, но нужно действие человека. Держим капсулу дольше
+        # обычного — она и есть единственный способ узнать об этом, не читая лог.
+        beep(self.cfg, "error")
+        self.flash("clipboard", where, seconds=8.0)
 
 
 def main():
@@ -495,7 +605,21 @@ def main():
     ap.add_argument("--send", choices=COMMANDS,
                     help="отдать команду уже запущенному демону и выйти "
                          "(так тесты управляют записью, не трогая клавиатуру)")
+    ap.add_argument("--last", action="store_true",
+                    help="вернуть последнюю расшифровку в буфер обмена")
     args = ap.parse_args()
+
+    if args.last:
+        # Демон для этого не нужен намеренно: текст достают в том числе тогда,
+        # когда демон упал, — а это как раз случай, в котором он и терялся.
+        text = last_transcript()
+        if not text:
+            log("[info] сохранённых расшифровок нет")
+            return 1
+        pyperclip.copy(text)
+        preview = text[:120] + ("…" if len(text) > 120 else "")
+        print(f"в буфере обмена ({len(text)} симв.): «{preview}»")
+        return 0
 
     if args.send:
         try:
