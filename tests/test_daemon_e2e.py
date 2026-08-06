@@ -21,6 +21,7 @@ from pathlib import Path
 BASE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE))
 
+from keepalive import OFF_FILE  # noqa: E402
 from voice_core import LAST_TRANSCRIPT, load_groq_keys  # noqa: E402
 from voice_hotkey import CONTROL_PORT, send_command  # noqa: E402
 
@@ -72,6 +73,14 @@ def main():
         return 2
     except OSError:
         pass  # порт свободен, это и нужно
+
+    # Держим выключатель на время теста: сторож (keepalive.py) ходит по
+    # расписанию и, увидев свободный порт, поднимет НАСТОЯЩЕГО демона прямо
+    # посреди прогона — тот займёт порт, и тест развалится на ровном месте.
+    # Флаг снимаем в finally, каким бы ни был исход.
+    off_existed = OFF_FILE.exists()
+    if not off_existed:
+        OFF_FILE.write_text("идёт tests/test_daemon_e2e.py\n", encoding="utf-8")
 
     proc = subprocess.Popen(
         [sys.executable, str(BASE / "voice_hotkey.py"),
@@ -130,6 +139,14 @@ def main():
     finally:
         if proc.poll() is None:
             proc.kill()
+        # Выключатель обязан уйти в любом случае: оставленный флаг молча выключит
+        # голосовой ввод человеку до следующего start_hotkey.cmd.
+        if not off_existed and OFF_FILE.exists():
+            try:
+                OFF_FILE.unlink()
+            except OSError:
+                print(f"ВНИМАНИЕ: не убран {OFF_FILE} — голосовой ввод останется "
+                      f"выключенным, удалите файл вручную")
 
     passed = sum(1 for _, ok, _ in results if ok)
     print("\n" + "=" * 60)

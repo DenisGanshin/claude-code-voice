@@ -42,6 +42,8 @@ import keyboard
 import pyperclip
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from keepalive import OFF_FILE  # noqa: E402 — общее имя файла-выключателя
+from tray import TrayIcon  # noqa: E402
 from voice_core import (  # noqa: E402
     FLASH_TTL_EXTRA,
     KEYS_FILE,
@@ -249,6 +251,7 @@ class Daemon:
         self._synthetic_until = 0.0  # окно, в котором нажатие CapsLock — наше собственное
         self._lamp_lock = threading.Lock()  # set_lamp зовут два потока: сессия и сторож
         self._lamp_misses = 0  # сколько раз подряд лампа не поддалась
+        self.tray = None
 
     # -- обработчики хоткеев (выполняются в потоке хука: только флаги!) ------ #
 
@@ -341,6 +344,7 @@ class Daemon:
         keyboard.add_hotkey(quit_key, self.on_quit)
 
         self.start_overlay()
+        self.start_tray()
         probe = Recorder(self.cfg)
         log("=" * 62)
         log(f"  Голосовой ввод активен.  Микрофон: {probe.device_name}")
@@ -361,6 +365,8 @@ class Daemon:
 
         self.set_lamp(False)  # выход на ходу не должен оставить включённый CapsLock
         self.stop_overlay()
+        if self.tray:
+            self.tray.stop()
         log("[info] демон остановлен")
         write_status("демон остановлен")
         return 0
@@ -381,6 +387,46 @@ class Daemon:
         # force: демон — резидент, на выходе окно закрывается целиком, даже если
         # его рисует индикатор, оставшийся от прошлого запуска.
         release_overlay(force=True)
+
+    # -- значок в трее ------------------------------------------------------- #
+
+    def start_tray(self):
+        """
+        Значок с единственным пунктом «Выключить инструмент».
+
+        Он нужен именно потому, что появился сторож (`keepalive.py`): демон
+        теперь поднимается сам, и «просто закрыть» его больше нельзя — через
+        пять минут он вернётся. Инструмент, который сам себя чинит, обязан
+        иметь видимый выключатель, иначе человек оказывается заперт внутри
+        собственной автоматики.
+        """
+        try:
+            self.tray = TrayIcon(on_stop=self.stop_from_tray,
+                                 tooltip="Голосовой ввод: CapsLock — старт/стоп")
+            threading.Thread(target=self.tray.run, daemon=True).start()
+            self.tray.wait_ready(timeout=5.0)
+        except Exception as e:  # noqa: BLE001 — без значка работать можно, без записи нет
+            log(f"[warn] значок в трее не создан: {e}")
+            self.tray = None
+
+    def stop_from_tray(self):
+        """
+        Выключение по кнопке: это осознанный отказ от инструмента, а не сбой.
+
+        Поэтому кладём файл-выключатель — сторож обязан его увидеть и НЕ
+        поднимать демона обратно. Без файла кнопка была бы обманом: значок
+        исчезал бы, а через пять минут всё возвращалось.
+        """
+        try:
+            OFF_FILE.write_text(
+                f"выключено через значок в трее {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"включить обратно: start_hotkey.cmd (файл удалится сам)\n",
+                encoding="utf-8")
+            log("[info] выключено через значок — сторож поднимать не будет")
+        except OSError as e:
+            log(f"[warn] не удалось создать {OFF_FILE.name}: {e} — "
+                f"сторож поднимет демона снова")
+        self.on_quit()
 
     def set_lamp(self, on):
         """
@@ -588,8 +634,13 @@ class Daemon:
             return
         # Не дошло: текст цел, но нужно действие человека. Держим капсулу дольше
         # обычного — она и есть единственный способ узнать об этом, не читая лог.
+        #
+        # В капсулу идёт ДЕЙСТВИЕ, а не полное описание: подпись обрезается по
+        # ширине плашки, и «фокус ушёл в «Telegram» — текст в ...» теряло ровно
+        # тот хвост, ради которого капсула и показывается (замер на экране 06.08).
+        # Куда именно уехал фокус — в логе и статусе, там место не кончается.
         beep(self.cfg, "error")
-        self.flash("clipboard", where, seconds=8.0)
+        self.flash("clipboard", "нажмите Ctrl+V", seconds=8.0)
 
 
 def main():
@@ -638,6 +689,20 @@ def main():
         overrides["input_device_preferences"] = [args.device]
     if args.fake_mic:
         overrides["fake_mic_wav"] = args.fake_mic
+
+    # Явный запуск и есть включение: снимаем выключатель, иначе сторож будет
+    # молчать и после перезагрузки инструмент опять окажется выключенным —
+    # причём без единого следа, почему.
+    #
+    # Кроме запуска с подставным микрофоном: это автотест, а не решение человека
+    # пользоваться инструментом. Иначе тест, поставивший выключатель, чтобы
+    # сторож не лез в его порт, сам же этот выключатель и снимает.
+    if not args.fake_mic and OFF_FILE.exists():
+        try:
+            OFF_FILE.unlink()
+            log("[info] выключатель снят — сторож снова следит за демоном")
+        except OSError as e:
+            log(f"[warn] не удалось убрать {OFF_FILE.name}: {e}")
 
     lock = ensure_single_instance()
     if lock is None:
