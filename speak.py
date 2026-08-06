@@ -37,9 +37,9 @@ def show_quota(cfg):
         return 2
     limit = cfg["tts_premium_max_chars"]
     total_left = 0
-    for num, used, cap in rows:
+    for num, used, cap, note in rows:
         if cap is None:
-            print(f"ключ #{num}: ответа нет (сеть или ключ недействителен)")
+            print(f"ключ #{num}: {note or 'ответа нет'}")
             continue
         left = cap - used
         total_left += left

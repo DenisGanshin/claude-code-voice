@@ -115,9 +115,9 @@ def show_balances():
         print("[error] ключей ElevenLabs не найдено")
         return 0
     total_left = 0
-    for num, used, limit in rows:
+    for num, used, limit, note in rows:
         if used is None:
-            print(f"  ключ #{num}: недоступен")
+            print(f"  ключ #{num}: {note or 'недоступен'}")
             continue
         left = limit - used
         total_left += left
