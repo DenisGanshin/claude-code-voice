@@ -411,6 +411,16 @@ def ensure_overlay(cfg):
     except OSError as e:
         log(f"[warn] индикатор не запустился: {e}")
         return None
+    # Popen «успешен» ровно в том смысле, что процесс создан. Дальше он может
+    # умереть на первом же импорте (не поставлен Pillow) — и это НЕ видно ниоткуда:
+    # stderr уходит в DEVNULL. Молчаливое отсутствие индикатора опаснее любой
+    # ошибки: запись идёт, а на экране ничего. Поэтому смотрим, дожил ли он.
+    time.sleep(0.35)
+    if _overlay_proc.poll() not in (None, 0):
+        log(f"[warn] индикатор упал сразу после запуска (код {_overlay_proc.poll()}). "
+            f"Чаще всего не установлен Pillow: pip install -r requirements.txt")
+        _overlay_proc = None
+        return None
     if not _overlay_atexit_done:
         # Индикатор переживает того, кто его запустил: без этого каждая диктовка
         # через /voice оставляла бы за собой невидимый процесс.

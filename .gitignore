@@ -31,7 +31,10 @@ tts_models/
 __pycache__/
 *.pyc
 _daemon.log
+_keepalive.log
 _last_run.status
 _recording.json
 _recording.tmp
+_daemon.off
+_tray.ico
 _test_tmp/

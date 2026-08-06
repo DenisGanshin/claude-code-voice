@@ -16,4 +16,4 @@ echo Voice input daemon started.
 echo   CapsLock  start/stop     Alt+X  cancel     Ctrl+Alt+Q  quit
 echo   Log:    %~dp0_daemon.log
 echo   Status: %~dp0_last_run.status
-timeout /t 4 >nul
+timeout /t 4 >nul 2>nul
