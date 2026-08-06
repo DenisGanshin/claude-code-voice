@@ -21,7 +21,7 @@ from pathlib import Path
 BASE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE))
 
-from voice_core import load_groq_keys  # noqa: E402
+from voice_core import LAST_TRANSCRIPT, load_groq_keys  # noqa: E402
 from voice_hotkey import CONTROL_PORT, send_command  # noqa: E402
 
 STATE_FILE = BASE / "_recording.json"
@@ -98,6 +98,18 @@ def main():
 
         recognized = wait_for(lambda: "готово" in status(), timeout=60)
         check("текст доехал до конца конвейера", recognized, status())
+
+        # Расшифровка на диске — страховка от потери. Проверяем на живом демоне,
+        # а не только модульно: писать её должен он сам, в конце сессии.
+        saved_text = ""
+        if wait_for(lambda: LAST_TRANSCRIPT.exists(), timeout=5):
+            saved_text = LAST_TRANSCRIPT.read_text(encoding="utf-8").strip()
+        check("демон сохранил полный текст расшифровки", bool(saved_text),
+              f"«{saved_text[:60]}»")
+        day = BASE / "_transcripts" / f"{time.strftime('%Y-%m-%d')}.md"
+        check("история за день пополнилась", day.exists() and saved_text
+              and saved_text in day.read_text(encoding="utf-8"), str(day))
+        check("--last вернул бы именно её", _last_returns(saved_text), "буфер обмена")
         check("после записи демон не считает себя пишущим",
               json.loads(send_command("state")).get("recording") is False)
         check("индикатор погас сам",
@@ -134,6 +146,35 @@ def _pings():
         return send_command("ping", timeout=1.0) == "ok"
     except OSError:
         return False
+
+
+def _last_returns(expected):
+    """
+    Проверить `--last` по-настоящему — он кладёт текст в буфер обмена.
+
+    Буфер человека возвращаем на место: за этой машиной кто-то работает, и у него
+    там могло лежать что-то нужное. Тест не имеет права оставлять следы в том,
+    чем пользуются прямо сейчас.
+    """
+    if not expected:
+        return False
+    import pyperclip
+    try:
+        before = pyperclip.paste()
+    except Exception:  # noqa: BLE001
+        before = None
+    try:
+        subprocess.run([sys.executable, str(BASE / "voice_hotkey.py"), "--last"],
+                       cwd=str(BASE), capture_output=True, timeout=20)
+        return pyperclip.paste().strip() == expected
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        if before is not None:
+            try:
+                pyperclip.copy(before)
+            except Exception:  # noqa: BLE001
+                pass
 
 
 if __name__ == "__main__":
