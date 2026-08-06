@@ -77,7 +77,15 @@ def _is_quota_error(response):
 
 
 def balances():
-    """[(номер ключа, использовано, лимит)] — сводка по всему каскаду."""
+    """
+    [(номер ключа, использовано, лимит, примечание)] — сводка по всему каскаду.
+
+    Примечание объясняет, ПОЧЕМУ цифр нет, и это не мелочь. Ключ ElevenLabs можно
+    выпустить с урезанными правами: без `user_read` он не отдаёт баланс, но
+    прекрасно синтезирует. В сводке без пояснения такой ключ выглядит ровно как
+    протухший — и его пойдут перевыпускать вместо того, чтобы пользоваться
+    (проверено на втором ключе 2026-08-06: баланс 401, синтез 200).
+    """
     out = []
     for i, key in enumerate(load_keys(), 1):
         try:
@@ -85,11 +93,14 @@ def balances():
                              headers={"xi-api-key": key}, timeout=30)
             if r.status_code == 200:
                 d = r.json()
-                out.append((i, d.get("character_count"), d.get("character_limit")))
+                out.append((i, d.get("character_count"), d.get("character_limit"), None))
+            elif r.status_code == 401 and "missing_permission" in r.text.lower():
+                out.append((i, None, None,
+                            "баланс скрыт (нет права user_read) — синтез работает"))
             else:
-                out.append((i, None, None))
-        except requests.RequestException:
-            out.append((i, None, None))
+                out.append((i, None, None, f"HTTP {r.status_code}"))
+        except requests.RequestException as e:
+            out.append((i, None, None, f"сеть: {e.__class__.__name__}"))
     return out
 
 
