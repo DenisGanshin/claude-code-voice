@@ -1025,7 +1025,24 @@ class Recorder:
         self.device, self.device_name = idx, name
         log(f"[warn] уверенного сигнала нет нигде, беру самый громкий: "
             f"{name} (уровень {level:.5f})")
-        self._start_stream(idx)
+        # Это устройство мы только что закрыли в цикле выше, и MME освобождает
+        # его НЕ мгновенно: повторное открытие вплотную даёт «[Errno 22] Invalid
+        # argument». Ветка срабатывает, когда ни один микрофон не дотянул до
+        # порога живости, — то есть при подключённой, но лежащей гарнитуре и
+        # тишине в комнате (06.08: диктовка перестала работать целиком).
+        for attempt in range(3):
+            try:
+                self._start_stream(idx)
+                return
+            except Exception as e:  # noqa: BLE001
+                log(f"[warn] {name}: открытие не удалось ({str(e)[:60]}), "
+                    f"попытка {attempt + 1} из 3")
+                self._close()
+                time.sleep(0.25 * (attempt + 1))
+        raise RuntimeError(
+            f"микрофон «{name}» не открывается после трёх попыток. "
+            f"Если подключена гарнитура и лежит без дела — отключите её "
+            f"или уберите из input_device_preferences в config.json")
 
     def _read_block(self):
         block = self._read_block_raw()
