@@ -652,6 +652,7 @@ class Daemon:
             final, raw, note = process_audio(
                 audio, self.cfg, self.keys,
                 on_phase=lambda p: set_recording_state(True, phase=p, note=recorded),
+                report=rec.last_report,
             )
         except RuntimeError as e:
             log(f"[error] {e}")

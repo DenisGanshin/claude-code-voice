@@ -24,8 +24,10 @@ import voice_core  # noqa: E402  — нужен как модуль: через 
 from voice_core import (  # noqa: E402
     KEYS_FILE,
     Recorder,
+    audio_report,
     beep,
     clear_recording_state,
+    format_audio_report,
     list_input_devices,
     load_config,
     load_groq_keys,
@@ -77,13 +79,16 @@ def main():
         print("(ошибка: не найден ключ Groq — голосовой ввод не настроен)")
         return 2
 
-    recorded = None
+    recorded, report = None, None
     if args.file:
         audio = read_wav(args.file)
-        log(f"[info] файл {args.file}: {len(audio) / 16000:.1f} с")
+        # Метрики считаем и для файла: прогон сохранённой записи должен давать
+        # тот же вердикт о её пригодности, что и живая диктовка. Иначе разбор
+        # «почему получилась чушь» на файле выглядит иначе, чем в бою.
+        report = audio_report(audio)
+        log(f"[info] файл {args.file}: {format_audio_report(report)}")
     else:
         rec = Recorder(cfg)
-        log(f"[info] микрофон: {rec.device_name}")
         write_status(f"старт записи, устройство: {rec.device_name}")
         # Капсулу поднимает и гасит сам Recorder — от факта открытия потока.
         audio = rec.record_auto(on_ready=lambda: (beep(cfg, "start"), log("[info] ГОВОРИТЕ…")))
@@ -96,6 +101,7 @@ def main():
         # блокирует поток на 140 мс, и капсула успела бы заметно мигнуть между
         # «пишу» и «расшифровываю».
         recorded = f"записано {len(audio) / 16000:.1f} с"
+        report = rec.last_report
         set_recording_state(True, phase="stt", note=recorded)
         beep(cfg, "stop")
         log(f"[info] {recorded}")
@@ -114,7 +120,8 @@ def main():
 
     try:
         final, raw, note = process_audio(audio, cfg, keys,
-                                         on_phase=on_phase if recorded else None)
+                                         on_phase=on_phase if recorded else None,
+                                         report=report)
     except RuntimeError as e:
         log(f"[error] {e}")
         beep(cfg, "error")
