@@ -1,10 +1,12 @@
 {
   "input_device_preferences": [
-    "Headset",
-    "Headphones",
+    "Internal Microphone",
     "Microphone Array",
-    "Internal Microphone"
+    "Headset",
+    "Headphones"
   ],
+  "multi_source": true,
+  "multi_source_max": 2,
   "hotkey": "caps lock",
   "cancel_hotkey": "alt+x",
   "quit_hotkey": "ctrl+alt+q",

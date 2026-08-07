@@ -688,6 +688,133 @@ def pick_input_device(preferences):
 
 
 # --------------------------------------------------------------------------- #
+# Качество записи: сколько в ней РЕЧИ, а не громкости
+# --------------------------------------------------------------------------- #
+
+# Полоса разборчивости. Основной тон голоса лежит ниже (85-250 Гц), но различаются
+# звуки речи ФОРМАНТАМИ — резонансами голосового тракта в 300-3400 Гц. Это не
+# теория, а измеренная причина инцидента 07.08: у записи из соседней комнаты
+# 86% энергии сидело в 100-300 Гц, то есть до микрофона дошёл гул голоса без
+# единого признака, по которому различаются слова. Считать такую запись «тихой,
+# но пригодной» по общему RMS — ровно та ошибка, из-за которой мусор уехал в облако.
+SPEECH_BAND_HZ = (300.0, 3400.0)
+SPEECH_BLOCK = 480  # 30 мс при 16 кГц
+
+# Ниже этого — запись считается пустой: речи в ней нет, а что бы ни вернул Whisper,
+# это додумано моделью, а не услышано.
+#
+# Замер на реальных записях 2026-08-07 (одна машина, один вечер, один микрофон).
+# Каждая строка проверена расшифровкой — вердикт не выведен из уровня, а прочитан:
+#
+#   запись           скор      что вышло из расшифровки
+#   23:08:47      0.0687      нормальный текст, всё верно
+#   23:22:40      0.0345      нормальный текст (гарнитура уже отключена)
+#   23:25:44      0.0378      нормальный текст
+#   23:29:33      0.0255      нормальный текст, САМАЯ ТИХАЯ из удачных
+#   ─────────────────────────  ↑ удачные / провальные ↓  разрыв в 9.8 раза
+#   23:32:54      0.0026      «Я уже говорила с этой пиксией…» — выдумано целиком
+#   23:31:47      0.0024      «Добрый день, я хочу, чтобы мы это сделали…» — выдумано
+#   23:10:46      0.00017     абракадабра на 313 символов
+#   23:10:12      0.00017     «речь не распознана»
+#   23:11:29      0.0000      «Добро пожаловать в Казахстан!»
+#
+# Порог стоит в разрыве: втрое ниже худшей удачной записи и втрое выше лучшей
+# провальной. Асимметрия цены сознательная — ложная тревога стоит одной лишней
+# пометки, а пропуск отдаёт человеку выдуманный текст под видом сказанного.
+#
+# ⚠ Первая версия порога (0.002) была откалибрована по трём провальным записям и
+# оказалась ВДВОЕ занижена: две записи со скором 0.0024-0.0026 прошли бы как
+# «нормальные», хотя расшифровка в них выдумана от первого слова. Урок общий:
+# порог, посчитанный как «середина между известными случаями», держится ровно до
+# первого случая, которого в выборке не было. Прежде чем двигать это число —
+# прогнать `python diag_audio.py` по свежим записям и РАСШИФРОВАТЬ пограничные,
+# а не судить по одному уровню.
+SPEECH_ALARM_SCORE = 0.008
+
+
+def band_block_rms(audio, sr=SAMPLE_RATE):
+    """Поблочный (30 мс) уровень сигнала внутри формантной полосы."""
+    if audio is None or len(audio) < SPEECH_BLOCK:
+        return np.zeros(0)
+    n = len(audio) // SPEECH_BLOCK * SPEECH_BLOCK
+    blocks = np.asarray(audio[:n], dtype=np.float64).reshape(-1, SPEECH_BLOCK)
+    spec = np.abs(np.fft.rfft(blocks * np.hanning(SPEECH_BLOCK), axis=1))
+    freqs = np.fft.rfftfreq(SPEECH_BLOCK, 1 / sr)
+    band = (freqs >= SPEECH_BAND_HZ[0]) & (freqs <= SPEECH_BAND_HZ[1])
+    # Парсеваль: нормируем на длину окна, чтобы число читалось как RMS в полосе
+    return np.sqrt((spec[:, band] ** 2).sum(axis=1)) / SPEECH_BLOCK
+
+
+def speech_score(audio, sr=SAMPLE_RATE):
+    """
+    «Насколько громко в записи звучит РЕЧЬ» — 90-й перцентиль поблочного уровня
+    в формантной полосе.
+
+    Перцентиль, а не среднее: в диктовке всегда есть паузы, и среднее по ним
+    размывает разницу между «человек говорил» и «микрофон шумел». 90-й перцентиль
+    отвечает на нужный вопрос — насколько громки самые звучные моменты.
+
+    Возвращает (скор, доля речевых блоков). Второе число не для порога, а для лога:
+    по нему видно, была речь короткой или её не было вовсе.
+    """
+    brms = band_block_rms(audio, sr)
+    if len(brms) == 0:
+        return 0.0, 0.0
+    return float(np.percentile(brms, 90)), float(np.mean(brms > SPEECH_ALARM_SCORE))
+
+
+def trim_silence(audio, sr=SAMPLE_RATE, pad_sec=0.3):
+    """
+    Срезать тишину по краям записи, оставив запас в `pad_sec`.
+
+    Нужно в двух местах и по разным причинам. Для сравнения источников — чтобы
+    входы были приведены к одному виду (иначе выигрывает тот, кого уже подрезали).
+    Для отправки в облако — потому что Whisper на длинной тишине по краям
+    склонен дописывать титры-приветствия: чем больше пустоты, тем охотнее.
+
+    Порог относительный (доля от самого громкого места), а не абсолютный: тихий
+    голос вблизи и громкий издалека должны обрезаться по своим краям, а не по
+    общему для всех уровню.
+    """
+    brms = band_block_rms(audio, sr)
+    if len(brms) == 0:
+        return audio
+    loud = brms > max(SPEECH_ALARM_SCORE * 0.5, float(np.percentile(brms, 90)) * 0.12)
+    idx = np.flatnonzero(loud)
+    if len(idx) == 0:
+        return audio  # резать нечего: речи не нашлось нигде — пусть решает вызывающий
+    pad = int(pad_sec * sr / SPEECH_BLOCK)
+    lo = max(0, idx[0] - pad) * SPEECH_BLOCK
+    hi = min(len(brms), idx[-1] + 1 + pad) * SPEECH_BLOCK
+    return np.asarray(audio[lo:hi])
+
+
+def audio_report(audio, sr=SAMPLE_RATE):
+    """Метрики записи одной строкой — то, чего не хватало в логе 07.08."""
+    if audio is None or len(audio) == 0:
+        return {"sec": 0.0, "rms": 0.0, "dbfs": -999.0, "peak": 0.0,
+                "score": 0.0, "voiced": 0.0, "quiet": True}
+    a = np.asarray(audio, dtype=np.float64)
+    rms = float(np.sqrt(np.mean(a * a)))
+    score, voiced = speech_score(a, sr)
+    return {
+        "sec": len(a) / sr,
+        "rms": rms,
+        "dbfs": 20 * np.log10(rms + 1e-12),
+        "peak": float(np.max(np.abs(a))),
+        "score": score,
+        "voiced": voiced,
+        "quiet": score < SPEECH_ALARM_SCORE,
+    }
+
+
+def format_audio_report(rep):
+    return (f"{rep['sec']:.1f} с, речь={rep['score']:.5f} "
+            f"({rep['voiced'] * 100:.0f}% блоков), уровень={rep['dbfs']:.0f} dBFS, "
+            f"пик={rep['peak']:.3f}")
+
+
+# --------------------------------------------------------------------------- #
 # Запись
 # --------------------------------------------------------------------------- #
 
@@ -802,6 +929,19 @@ class Recorder:
         # устройство, потом чтобы прогреть его и оценить фон. Это стоило лишних
         # 0.3 с на каждом старте записи (замер 2026-08-05).
         self._warm = None
+        # Параллельные источники: те же слова, записанные другими микрофонами.
+        # Ведущий (self._stream) остаётся единственным, по которому идут VAD,
+        # индикатор и тайминги, — дублирующие потоки только копят звук, чтобы в
+        # конце можно было выбрать лучший. См. _start_extra_sources.
+        self._extra = []
+        self._extra_lock = threading.Lock()
+        self._extra_thread = None
+        self._extra_stop = threading.Event()
+        # Итог выбора — для лога и для вызывающего кода (пометка тихой записи).
+        self.last_report = None
+        self.chosen_name = None
+        self.rejected = []
+        self._probe_level = None
 
     # -- низкий уровень ----------------------------------------------------- #
 
@@ -853,8 +993,18 @@ class Recorder:
     def _open(self):
         self._raise_indicator()
         if self.fake_wav:
+            log(f"[info] источник: {self.device_name}")
             return self._open_fake()
-        return self._open_real()
+        result = self._open_real()
+        # Устройство пишем в лог ВСЕГДА, а не только когда что-то не так. 07.08
+        # разбор «почему расшифровка бредовая» уперся ровно в это: в логе штатной
+        # записи источника не было, и физический микрофон пришлось определять
+        # по спектру сохранённого WAV. Строка стоит ничего, а без неё вопрос
+        # «чем это записано» не имеет ответа вообще.
+        log(f"[info] микрофон: {self.device_name}"
+            + (f" (проба {self._probe_level:.5f})" if self._probe_level is not None else ""))
+        self._start_extra_sources()
+        return result
 
     # -- экранный индикатор -------------------------------------------------- #
 
@@ -927,6 +1077,117 @@ class Recorder:
                 blocksize=self.blocksize, dtype="float32",
             )
             self._stream.start()
+
+    def _extra_candidates(self):
+        """
+        Микрофоны, которые стоит писать ПАРАЛЛЕЛЬНО с ведущим.
+
+        Берём все физические входы, а НЕ только перечисленные в предпочтениях:
+        смысл дубля ровно в том, чтобы поймать случай, когда выбор оказался
+        неверным. Список предпочтений — это то, во что мы верили заранее, и
+        07.08 он ошибся.
+
+        Дедупликация по имени: один микрофон система показывает через MME,
+        DirectSound и WASAPI. Писать его трижды бессмысленно — это один и тот же
+        воздух, а не второй источник.
+        """
+        lead_key = (self.device_name or "").lower()[:25]
+        seen, out = {lead_key}, []
+        devices = [d for d in list_input_devices() if "WDM-KS" not in d["api"]]
+        devices.sort(key=lambda d: (API_RANK.get(d["api"], 9), d["index"]))
+        for d in devices:
+            key = d["name"].lower()[:25]
+            # «Переназначение звуковых устр.» и «Первичный драйвер» — это не
+            # микрофоны, а системные мапперы: они отдают тот же поток, что и
+            # устройство по умолчанию, то есть заведомо дубль ведущего.
+            if key in seen or "переназначение" in key or "первичный" in key:
+                continue
+            seen.add(key)
+            out.append((d["index"], f"{d['name']} [{d['api']}]"))
+        return out[: max(0, int(self.cfg.get("multi_source_max", 2)))]
+
+    def _start_extra_sources(self):
+        """
+        Поднять дублирующие записи с остальных микрофонов — в ФОНОВОМ потоке.
+
+        Почему в фоне: Bluetooth-гарнитура переходит из A2DP в HFP до полутора
+        секунд, и ждать её открытия значило бы платить этой задержкой за каждую
+        диктовку. Ведущий поток уже открыт и пишет; дубли подключаются на ходу и
+        успевают ровно к прогреву.
+
+        Почему callback, а не read(): у каждого устройства своя частота и свой
+        темп. Синхронное чтение по кругу заставило бы быстрый источник ждать
+        медленного, и любой сбой одного микрофона тормозил бы запись целиком.
+        Callback складывает блоки сам, независимо от остальных.
+        """
+        if self.fake_wav or not self.cfg.get("multi_source", True):
+            return
+        candidates = self._extra_candidates()
+        if not candidates:
+            return
+
+        def worker():
+            for idx, name in candidates:
+                if self._extra_stop.is_set():
+                    return
+                src = {"name": name, "index": idx, "chunks": [], "stream": None,
+                       "sr": SAMPLE_RATE, "started": time.time()}
+
+                def cb(indata, _frames, _t, status, _src=src):
+                    # Внутри аудио-потока: только скопировать. Любая тяжёлая
+                    # работа здесь роняет звук всей системы.
+                    if status:
+                        pass
+                    _src["chunks"].append(indata[:, 0].copy())
+
+                try:
+                    stream = sd.InputStream(
+                        device=idx, channels=1, samplerate=SAMPLE_RATE,
+                        blocksize=self.blocksize, dtype="float32", callback=cb,
+                    )
+                    stream.start()
+                except Exception as e:  # noqa: BLE001
+                    try:
+                        info = sd.query_devices(idx)
+                        src["sr"] = int(info["default_samplerate"])
+                        stream = sd.InputStream(
+                            device=idx, channels=1, samplerate=src["sr"],
+                            blocksize=int(src["sr"] * BLOCK_MS / 1000),
+                            dtype="float32", callback=cb,
+                        )
+                        stream.start()
+                    except Exception as e2:  # noqa: BLE001
+                        log(f"[info] дубль «{name}» не открылся ({str(e2)[:50]})")
+                        continue
+                src["stream"] = stream
+                with self._extra_lock:
+                    self._extra.append(src)
+                log(f"[info] дубль пишет: {name}")
+
+        self._extra_stop.clear()
+        self._extra_thread = threading.Thread(target=worker, daemon=True,
+                                              name="voice-extra-sources")
+        self._extra_thread.start()
+
+    def _collect_extra(self):
+        """Забрать записанное дублями и закрыть их потоки. Возвращает [(имя, аудио)]."""
+        self._extra_stop.set()
+        with self._extra_lock:
+            sources, self._extra = self._extra, []
+        out = []
+        for src in sources:
+            try:
+                src["stream"].stop()
+                src["stream"].close()
+            except Exception:  # noqa: BLE001
+                pass
+            if not src["chunks"]:
+                continue
+            audio = np.concatenate(src["chunks"])
+            if src["sr"] != SAMPLE_RATE:
+                audio = resample_to_16k(audio, src["sr"])
+            out.append((src["name"], audio))
+        return out
 
     # Порог «устройство вообще работает». Отвергаем ТОЛЬКО ровный цифровой ноль —
     # заглушку драйвера (DirectSound на FreeBuds отдаёт именно её).
@@ -1007,6 +1268,7 @@ class Recorder:
             if level >= self.LIVE_LEVEL:
                 self.device, self.device_name = idx, name
                 self._warm = (blocks, rms_values)
+                self._probe_level = level
                 if level < self.QUIET_HINT_LEVEL:
                     # Не ошибка: возможно, просто тихо. Но если это гарнитура и она
                     # лежит на столе, диктовка уйдёт в никуда — пусть человек знает.
@@ -1023,6 +1285,7 @@ class Recorder:
             raise RuntimeError("ни один микрофон не открылся")
         level, idx, name = best
         self.device, self.device_name = idx, name
+        self._probe_level = level
         log(f"[warn] уверенного сигнала нет нигде, беру самый громкий: "
             f"{name} (уровень {level:.5f})")
         # Это устройство мы только что закрыли в цикле выше, и MME освобождает
@@ -1078,6 +1341,12 @@ class Recorder:
         return data[:, 0].copy()
 
     def _close(self):
+        # Дубли гасим здесь же: если запись оборвалась исключением, `_finalize`
+        # не вызовется, а открытые потоки останутся жить и держать устройства.
+        if self._extra:
+            for _ in self._collect_extra():
+                pass
+        self._extra_stop.set()
         if self._stream is not None:
             try:
                 self._stream.stop()
@@ -1193,6 +1462,15 @@ class Recorder:
                         collected.extend(self._preroll)
                         write_status("речь началась")
                     elif waited >= wait_blocks:
+                        # Ведущий не услышал речи — но её мог услышать дубль.
+                        # Это главный сценарий 07.08: выбранным оказался микрофон,
+                        # лежащий в другой комнате, а человек говорил в ноутбук.
+                        # Раньше здесь безусловно возвращалась «тишина».
+                        rescued = self._finalize(None)
+                        if rescued is not None and not (self.last_report or {}).get("quiet", True):
+                            log(f"[warn] ведущий микрофон речи не услышал, дубль "
+                                f"«{self.chosen_name}» — услышал. Беру его.")
+                            return rescued
                         write_status("тишина: речь не началась")
                         return None
                     continue
@@ -1261,11 +1539,55 @@ class Recorder:
             self._lower_indicator()
 
     def _finalize(self, audio):
-        if audio is None or len(audio) == 0:
+        """
+        Свести записанное и выбрать источник, в котором СЛЫШНА речь.
+
+        Сравнение идёт по `speech_score`, а не по громкости: далёкий микрофон
+        отдаёт низкочастотный гул, который по RMS может обойти близкий, но
+        разборчивости в нём нет (замер 07.08 — 86% энергии ниже 300 Гц).
+
+        Тишина обрезается у ВСЕХ кандидатов до сравнения. Ведущий поток приходит
+        сюда уже подрезанным по VAD, а дубли — сырыми, от нажатия до нажатия.
+        Сравнивать их как есть значило бы дать ведущему фору: у длинной записи с
+        хвостом тишины перцентиль ниже при той же громкости голоса. Приводить
+        входы к одному виду обязательно ДО того, как их сравнивать.
+        """
+        candidates = []
+        if audio is not None and len(audio):
+            if self.native_sr != SAMPLE_RATE:
+                audio = resample_to_16k(audio, self.native_sr)
+            candidates.append((self.device_name or "ведущий", audio))
+        candidates.extend(self._collect_extra())
+        if not candidates:
             return None
-        if self.native_sr != SAMPLE_RATE:
-            audio = resample_to_16k(audio, self.native_sr)
-        return audio
+
+        scored = []
+        for name, a in candidates:
+            trimmed = trim_silence(a)
+            rep = audio_report(trimmed)
+            scored.append((rep["score"], name, trimmed, rep))
+        scored.sort(key=lambda t: -t[0])
+
+        best_score, best_name, best_audio, best_rep = scored[0]
+        self.chosen_name = best_name
+        self.last_report = best_rep
+        self.rejected = [(n, r) for _s, n, _a, r in scored[1:]]
+
+        if len(scored) > 1:
+            for score, name, _a, rep in scored:
+                mark = "→" if name == best_name else " "
+                log(f"[info] {mark} источник «{name}»: {format_audio_report(rep)}")
+            if best_name != (self.device_name or "ведущий"):
+                log(f"[warn] ведущий микрофон проиграл дублю — пишу с «{best_name}». "
+                    f"Похоже, выбранное устройство слышит хуже второго.")
+        else:
+            log(f"[info] запись: {format_audio_report(best_rep)}")
+
+        if best_rep["quiet"]:
+            log(f"[warn] РЕЧИ ПОЧТИ НЕТ (речь={best_score:.5f} при пороге "
+                f"{SPEECH_ALARM_SCORE}). Расшифровка такой записи ненадёжна: "
+                f"модель домысливает текст на тишине.")
+        return best_audio
 
     @property
     def duration_hint(self):
@@ -1686,17 +2008,28 @@ def normalize(text, cfg, keys):
 # Полный конвейер
 # --------------------------------------------------------------------------- #
 
-def process_audio(audio, cfg, keys, on_phase=None):
+QUIET_RECORDING_MARK = "⚠ ТИХАЯ ЗАПИСЬ, текст мог быть выдуман: "
+
+
+def process_audio(audio, cfg, keys, on_phase=None, report=None):
     """
     Аудио -> (итоговый текст, сырая расшифровка, пометка о статусе).
 
     on_phase("stt"|"edit") вызывается перед каждым сетевым шагом: обе фазы идут
     по несколько секунд, и без сигнала снаружи индикатор не отличит работу от зависания.
+
+    `report` — метрики записи от `audio_report`. Если речи в ней почти не было,
+    результат помечается прямо в тексте. Пометка стоит в НАЧАЛЕ строки намеренно:
+    расшифровка уезжает в поле ввода, где её читают с первого слова, а не целиком.
+    Отдельная строчка в логе эту роль выполнить не может — 07.08 предупреждение
+    «слышит очень тихо» было выдано за 17 секунд до того, как «Добро пожаловать в
+    Казахстан!» уехало в задачу, и не остановило ничего.
     """
     def phase(name):
         if on_phase:
             on_phase(name)
 
+    quiet = bool(report and report.get("quiet"))
     phase("stt")
     raw = transcribe(audio, cfg, keys)
     if not raw or is_hallucination(raw):
@@ -1706,6 +2039,10 @@ def process_audio(audio, cfg, keys, on_phase=None):
     # Написание терминов чиним детерминированно и ПОСЛЕ модели: так результат
     # не зависит от того, что решила LLM в этот раз.
     final = fix_terms_case(final, session_terms(cfg))
+    if quiet and final:
+        final = QUIET_RECORDING_MARK + final
+        note = f"{note}; запись почти пустая (речь={report.get('score', 0):.5f})"
+        log(f"[warn] результат помечен как ненадёжный: в записи не было речи")
     return final, raw, note
 
 
