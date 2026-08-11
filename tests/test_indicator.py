@@ -8,19 +8,27 @@
 и проверять надо именно это: не «демон умеет показывать», а «микрофон нельзя
 открыть незаметно».
 
-Проверки разделены на три группы:
+Проверки разделены на группы:
 
   A. Владение капсулой — без железа и без окон (подменённый файл состояния).
   B. Живой микрофон: пока поток открыт, состояние активно; закрылся — погасло.
   C. Положение капсулы на экране из config.json — чистая геометрия.
+  D. Запись состояния под живым читателем.
+  E. Окно уже поднято — второго процесса не заводим (замер 11.08: 355 мс).
 
 Файл состояния подменяется на временный НАМЕРЕННО: настоящий читает работающий
 демон, и тест иначе мигал бы капсулой человеку, сидящему за этой же машиной.
 
-Запуск:  python tests/test_indicator.py
+⚠ Группа B открывает НАСТОЯЩИЙ микрофон. Остальные — нет, и их можно прогнать
+отдельно: это единственный способ проверить индикатор, не спрашивая разрешения
+у человека каждый раз.
+
+Запуск:  python tests/test_indicator.py            (всё, включая живой микрофон)
+         python tests/test_indicator.py --no-mic   (без обращения к устройству)
 """
 
 import json
+import subprocess
 import sys
 import tempfile
 import threading
@@ -423,11 +431,72 @@ def test_write_retries():
         check("и запись не роняет вызывающий код", True)
 
 
+# --------------------------------------------------------------------------- #
+# E. Окно уже есть — второй процесс не поднимаем
+# --------------------------------------------------------------------------- #
+# Замер 11.08: старт записи стоил 1.18 с, из них 355 мс уходило на запуск
+# процесса индикатора, который тут же умирал, увидев занятый мьютекс. Кеш
+# `_overlay_proc` от этого не спасает: он помнит МОЙ процесс, а окно бывает
+# чужим — его завёл демон. Платили `/voice`, `ask.py` и тесты, каждый раз.
+
+
+def test_overlay_reuse():
+    check("класс окна в ядре не разъехался с настоящим",
+          voice_core.OVERLAY_WINDOW_CLASS == overlay.WINDOW_CLASS,
+          f"{voice_core.OVERLAY_WINDOW_CLASS} / {overlay.WINDOW_CLASS}")
+
+    # Измеритель проверяем раньше продукта: функция обязана уметь отвечать «нет»,
+    # иначе проверка ниже пройдёт и с окном, и без него, не доказав ничего.
+    real_class = voice_core.OVERLAY_WINDOW_CLASS
+    voice_core.OVERLAY_WINDOW_CLASS = "ClaudeVoiceOverlayЗаведомоНетТакого"
+    try:
+        check("несуществующее окно не находится",
+              voice_core.overlay_window_exists() is False)
+    finally:
+        voice_core.OVERLAY_WINDOW_CLASS = real_class
+
+    own = None
+    if not voice_core.overlay_window_exists():
+        # Своего окна нет — поднимаем сами, чтобы проверке было на что смотреть.
+        # Капсула при этом не покажется: состояние неактивно, окно скрыто.
+        pythonw = Path(sys.executable).with_name("pythonw.exe")
+        exe = str(pythonw) if pythonw.exists() else sys.executable
+        own = subprocess.Popen([exe, str(BASE / "overlay.py")], cwd=str(BASE),
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.time() + 15
+        while time.time() < deadline and not voice_core.overlay_window_exists():
+            time.sleep(0.2)
+
+    try:
+        if not voice_core.overlay_window_exists():
+            skip("окно уже есть — второй процесс не поднимаем", "окно не появилось")
+            return
+        voice_core._overlay_proc = None  # как у процесса, который окна не заводил
+        t = time.perf_counter()
+        proc = voice_core.ensure_overlay({"show_overlay": True})
+        elapsed = time.perf_counter() - t
+        check("при живом окне процесс не запускается",
+              proc is None and voice_core._overlay_proc is None,
+              "иначе он умрёт о мьютекс, а старт записи подорожает")
+        # 355 мс — измеренная цена запуска. Порог в семь раз ниже: проверка
+        # обязана краснеть от возврата Popen, а не от медленной машины.
+        check("ответ стоит микросекунды, а не треть секунды",
+              elapsed < 0.05, f"{elapsed * 1000:.1f} мс")
+    finally:
+        if own is not None:
+            own.kill()  # своё, поднятое этим тестом; чужое окно не трогаем
+
+
 def main():
+    no_mic = "--no-mic" in sys.argv
     test_ownership()
     test_placement()
     test_write_retries()
-    test_live_microphone()
+    test_overlay_reuse()
+    if no_mic:
+        skip("живой микрофон", "запрошен --no-mic")
+    else:
+        test_live_microphone()
 
     failed = [r for r in results if not r[1]]
     print("\n" + "=" * 60)

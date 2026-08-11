@@ -13,6 +13,7 @@
 """
 
 import atexit
+import ctypes
 import io
 import json
 import math
@@ -380,6 +381,36 @@ def level_from_rms(rms):
     return max(0.0, min(1.0, (db + 55) / 45))  # -55 дБ — тишина, -10 дБ — максимум
 
 
+# Класс окна индикатора. Дублирует overlay.WINDOW_CLASS осознанно: импортировать
+# overlay сюда нельзя — он поднимает окно и живёт отдельным процессом, а ядро
+# грузится в каждой диктовке. Расхождение стерегут тесты (test_indicator).
+OVERLAY_WINDOW_CLASS = "ClaudeVoiceOverlay"
+
+
+def overlay_window_exists():
+    """
+    Есть ли окно индикатора на экране — вопрос к Windows, а не к нашему Popen.
+
+    Разница существенная. `_overlay_proc.poll() is None` отвечает, жив ли МОЙ
+    процесс, но окно бывает чужим: демон поднял его первым, а мой экземпляр вышел
+    сам, увидев занятый мьютекс. Тогда кеш пуст навсегда и КАЖДОЕ обращение к
+    микрофону платит за запуск процесса, который тут же умрёт. Замер 11.08 —
+    355 мс на каждый старт записи у `/voice`, `ask.py` и тестов; у демона этой
+    цены нет только потому, что окно завёл он сам.
+
+    Ошибку глотаем и отвечаем «нет»: не найти окно — повод запустить процесс
+    (там мьютекс всё равно не даст второму экземпляру ужиться), а не падать.
+    """
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        # restype обязателен: на x64 дескриптор по умолчанию режется до int.
+        user32.FindWindowW.restype = ctypes.c_void_p
+        user32.FindWindowW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
+        return bool(user32.FindWindowW(OVERLAY_WINDOW_CLASS, None))
+    except Exception:  # noqa: BLE001 — не Windows, нет user32, что угодно
+        return False
+
+
 def ensure_overlay(cfg):
     """
     Поднять процесс индикатора, если его ещё нет. Возвращает Popen либо None.
@@ -396,6 +427,11 @@ def ensure_overlay(cfg):
         return None
     if _overlay_proc is not None and _overlay_proc.poll() is None:
         return _overlay_proc
+    # Окно может держать чужой процесс — тогда запускать своё нечего и незачем:
+    # он всё равно упрётся в мьютекс и выйдет, а старт записи подорожает на треть
+    # секунды (см. overlay_window_exists). Проверка стоит микросекунды.
+    if overlay_window_exists():
+        return None
     script = BASE_DIR / "overlay.py"
     if not script.exists():
         return None

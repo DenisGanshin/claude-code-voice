@@ -36,6 +36,10 @@ BASE = Path(__file__).resolve().parent
 STATE_FILE = BASE / "_recording.json"
 CONFIG_FILE = BASE / "config.json"
 
+# Класс окна. По нему снаружи узнают, что индикатор уже на экране, не запуская
+# второй процесс ради ответа (voice_core.overlay_window_exists).
+WINDOW_CLASS = "ClaudeVoiceOverlay"
+
 # --------------------------------------------------------------------------- #
 # Оформление
 # --------------------------------------------------------------------------- #
@@ -315,13 +319,13 @@ class LayeredWindow:
         cls.cbSize = ctypes.sizeof(WNDCLASSEX)
         cls.lpfnWndProc = LayeredWindow._wndproc_ref
         cls.hInstance = hinst
-        cls.lpszClassName = "ClaudeVoiceOverlay"
+        cls.lpszClassName = WINDOW_CLASS
         user32.RegisterClassExW(ctypes.byref(cls))
 
         self.hwnd = user32.CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST
             | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-            "ClaudeVoiceOverlay", "Claude Voice", WS_POPUP,
+            WINDOW_CLASS, "Claude Voice", WS_POPUP,
             0, 0, width, height, None, None, hinst, None,
         )
 
