@@ -18,6 +18,7 @@
 Запуск:  python tests/test_lamp_and_start.py
 """
 
+import shutil
 import sys
 import time
 import wave
@@ -79,14 +80,22 @@ class FakeKeyboard:
             self.hook()
 
 
-def make_daemon(fake, recording=False, busy=False):
-    """Демон с подменённой клавиатурой и без звуков."""
+def make_daemon(fake, recording=False, busy=False, hook_alive=True):
+    """
+    Демон с подменённой клавиатурой и без звуков.
+
+    `hook_alive=False` — перехват клавиш отвалился: система нажатия принимает и
+    лампочку переключает, а до обработчиков демона они не доходят вовсе. Именно
+    так инструмент вставал 10.08.
+    """
     voice_hotkey.capslock_on = lambda: fake.caps
-    voice_hotkey.keyboard.send = fake.press
+    # Подменяется именно `tap`: демон жмёт клавиши через keybd_event, а не через
+    # keyboard.send (см. voice_hotkey.tap — почему).
+    voice_hotkey.tap = lambda vk: fake.press()
     d = voice_hotkey.Daemon({"beep": False, "show_overlay": False})
     d.recording = recording
     d.busy = busy
-    fake.hook = d.on_toggle  # событие клавиатуры приходит демону, как в жизни
+    fake.hook = d.on_toggle if hook_alive else None
     return d
 
 
@@ -147,6 +156,73 @@ def run_lamp_tests():
     check("отступившись, сторож перестаёт слать нажатия",
           fake.presses == d.LAMP_MAX_MISSES,
           f"{fake.presses} нажатий за 10 тиков")
+
+
+# --------------------------------------------------------------------------- #
+# D. Отказ перехвата клавиш: демон обязан заметить его сам
+# --------------------------------------------------------------------------- #
+
+def run_hook_recovery_tests():
+    """
+    Жалоба 10.08: «нажимаю CapsLock — ничего не идёт, и капс сам гаснет».
+
+    Демон был полностью жив — отвечал по сокету, поэтому и сторож считал, что всё
+    в порядке, — но события клавиатуры до его обработчиков не доходили: библиотека
+    отбрасывала их молча. Сторож лампочки видел «горит, а записи нет» и исправно
+    гасил капс: снаружи это и выглядело как «гаснет сам». Инструмент стоял до
+    ручного перезапуска.
+
+    Отличить отказ от штатного рассинхрона можно по одному признаку: лампочка
+    разошлась с записью — значит клавишу только что нажали, — а событий не
+    приходило. Ниже проверяется, что демон не путает это с остальными случаями.
+    """
+    print("\n--- D. Отказ перехвата клавиш ---")
+
+    # Перехват жив: расхождение лампы — обычное дело, лечится выравниванием.
+    fake = FakeKeyboard(caps=True)
+    d = make_daemon(fake, recording=False)
+    d._events_seen = time.time()
+    for _ in range(4):
+        d.lamp_tick()
+    check("перехват жив — перезапуск не запрашивается", d.respawn is False,
+          "иначе демон перезапускался бы на каждом рассинхроне")
+
+    # Перехват мёртв: лампа зажглась от нажатия, событий нет, гасить её нечем.
+    fake = FakeKeyboard(caps=True, dead=True)
+    d = make_daemon(fake, recording=False, hook_alive=False)
+    d._events_seen = time.time() - 10
+    d.lamp_tick()
+    check("одного признака мало — демон не спешит перезапускаться",
+          d.respawn is False, f"признаков {d._dead_signs}")
+    # Первый тик пытался выровнять лампу и открыл окно своего нажатия на 0.5 с.
+    # В жизни сторож просто тикает дальше (каждые 0.4 с) и попадает за окно; в
+    # тесте окно закрываем руками, чтобы не досиживать полсекунды впустую.
+    d._synthetic_until = 0.0
+    d.lamp_tick()
+    check("перехват мёртв — демон запросил перезапуск", d.respawn is True)
+    check("запрос перезапуска выводит демона из главного цикла",
+          d.quit.is_set() and d.toggle.is_set())
+
+    # Занят распознаванием: нажатие отвергли мы сами, перехват тут не при чём.
+    fake = FakeKeyboard(caps=True, dead=True)
+    d = make_daemon(fake, recording=False, busy=True, hook_alive=False)
+    d._events_seen = time.time() - 10
+    for _ in range(5):
+        d.lamp_tick()
+    check("занят распознаванием — это не отказ перехвата", d.respawn is False,
+          "иначе долгая расшифровка кончалась бы перезапуском")
+
+    # Отказ во время диктовки: человек нажал «стоп», до демона не дошло. Запись
+    # обязана остановиться, а не идти до предела длительности (десять минут).
+    fake = FakeKeyboard(caps=False, dead=True)
+    d = make_daemon(fake, recording=True, hook_alive=False)
+    d._events_seen = time.time() - 10
+    d.lamp_tick()
+    d._synthetic_until = 0.0  # см. выше: окно своего нажатия истекло
+    d.lamp_tick()
+    check("отказ во время записи — диктовка останавливается, а не висит до предела",
+          d.respawn is True and d.toggle.is_set(),
+          "toggle = тот же сигнал, что даёт нажатие «стоп»")
 
 
 # --------------------------------------------------------------------------- #
@@ -260,12 +336,13 @@ def main():
     tmp.mkdir(exist_ok=True)
     try:
         run_lamp_tests()
+        run_hook_recovery_tests()
         run_start_tests(tmp)
         run_log_tests()
     finally:
-        for f in tmp.glob("*.wav"):
-            f.unlink(missing_ok=True)
-        tmp.rmdir()
+        # Целиком, а не по маске: в этой же папке оставляет свои файлы
+        # test_focus_guard, и rmdir на непустой папке ронял прогон.
+        shutil.rmtree(tmp, ignore_errors=True)
 
     passed = sum(1 for _, ok, _ in results if ok)
     print("\n" + "=" * 60)

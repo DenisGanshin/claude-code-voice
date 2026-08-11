@@ -13,6 +13,10 @@
 буфера восстанавливается. Если за время распознавания фокус ушёл в другое окно,
 вставки НЕ будет: текст останется в буфере, а капсула скажет нажать Ctrl+V.
 
+Если перехват клавиш отваливается на ходу (демон жив и отвечает по сокету, а
+CapsLock до него не доходит), демон замечает это сам и поднимается заново —
+см. Daemon.recover_hotkeys.
+
 Полный текст каждой диктовки пишется в _transcripts/ и живёт 30 дней. Вернуть
 последнюю в буфер обмена, если она всё-таки потерялась:
 
@@ -33,6 +37,7 @@ import ctypes
 import ctypes.wintypes  # подмодуль не подтягивается сам импортом ctypes
 import json
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -103,18 +108,60 @@ def install_crash_logging():
         threading.excepthook = thread_hook
 
 
-def ensure_single_instance():
+def ensure_single_instance(wait_sec=0.0):
     """
     Два демона на одном хоткее — это две записи и два Ctrl+V подряд.
     Bind порта отдаёт ОС решать гонку, в отличие от pid-файла.
+
+    `wait_sec` нужен только автоперезапуску (см. Daemon.recover_hotkeys): свежий
+    процесс стартует, пока прежний ещё закрывает сокет, да и от команд по сокету
+    остаётся хвост TIME_WAIT. Живой демон за это время порт не отдаст, и второй
+    экземпляр всё равно не поднимется — ожидание ничего не ослабляет.
     """
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    deadline = time.time() + wait_sec
+    while True:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.bind(("127.0.0.1", CONTROL_PORT))
+            s.listen(4)
+            return s  # держим сокет живым всё время работы демона
+        except OSError:
+            s.close()
+            if time.time() >= deadline:
+                return None
+            time.sleep(0.5)
+
+
+def relaunch():
+    """
+    Поднять свежий демон вместо себя.
+
+    Отдельным процессом, а не через os.execv: у нас живые потоки и установленный
+    системный хук, подмена образа в таком состоянии на Windows ведёт себя
+    непредсказуемо. Аргументы запуска передаём как есть — иначе перезапуск молча
+    потерял бы, скажем, выбранный микрофон.
+
+    Если поднять не удалось, инструмент всё равно вернётся: сторож (keepalive.py)
+    увидит молчащий порт и запустит демона в течение пяти минут. Здесь мы просто
+    не заставляем человека столько ждать.
+    """
+    exe = Path(sys.executable)
+    pythonw = exe.with_name("pythonw.exe")
+    argv = [a for a in sys.argv[1:] if a != "--restarted"]
+    cmd = [str(pythonw if pythonw.exists() else exe),
+           str(Path(__file__).resolve()), *argv, "--restarted"]
+    # DETACHED_PROCESS | CREATE_NO_WINDOW: новый демон не должен ни зависеть от
+    # нашего процесса, ни показывать консольное окно.
+    flags = 0x00000008 | 0x08000000
     try:
-        s.bind(("127.0.0.1", CONTROL_PORT))
-        s.listen(4)
-    except OSError:
-        return None
-    return s  # держим сокет живым всё время работы демона
+        subprocess.Popen(cmd, cwd=str(Path(__file__).resolve().parent),
+                         creationflags=flags,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         stdin=subprocess.DEVNULL)
+        log("[info] поднят свежий демон")
+    except OSError as e:
+        log(f"[error] перезапустить демон не удалось: {e} — "
+            f"поднимет сторож в течение пяти минут")
 
 
 def send_command(command, timeout=3.0):
@@ -188,6 +235,60 @@ def focus_moved(target):
     return window_title(current) or "другое окно"
 
 
+# --------------------------------------------------------------------------- #
+# Синтетические нажатия — своими руками, в обход keyboard.send
+# --------------------------------------------------------------------------- #
+
+VK_CAPITAL = 0x14
+VK_CONTROL = 0x11
+VK_V = 0x56
+KEYEVENTF_KEYUP = 0x0002
+# ctrl, alt, shift, левая и правая Windows: всё, что человек может держать от
+# своего хоткея в момент, когда мы жмём Ctrl+V.
+MODIFIER_VKS = (VK_CONTROL, 0x12, 0x10, 0x5B, 0x5C)
+
+
+def _key(vk, down):
+    user32.keybd_event(vk, 0, 0 if down else KEYEVENTF_KEYUP, 0)
+
+
+def tap(vk):
+    """
+    Нажать и отпустить клавишу от имени системы.
+
+    Почему не `keyboard.send`, хотя события мы принимаем той же библиотекой.
+    `send` поднимает свой глобальный флаг `is_replaying` — чтобы не принять своё
+    же событие за пользовательское — и снимает его последней строкой, без
+    finally. Любое исключение внутри (имя клавиши разбирается по таблицам
+    раскладки, а зовут `send` у нас два потока) оставляет флаг поднятым НАВСЕГДА,
+    и с этого мгновения библиотека отбрасывает все события клавиатуры молча, не
+    доводя их до обработчиков. Снаружи это выглядит так: демон жив и отвечает по
+    сокету, лампочка исправно гаснет — её гасит тот же `send`, — а CapsLock
+    больше не запускает запись. Ровно так инструмент и встал 10.08, сразу после
+    удачной вставки — то есть после `keyboard.release()`, который стоял тогда в
+    `paste_text` и своё исключение проглатывал молча.
+
+    `keybd_event` адресует клавиши по VK-кодам: ничего глобального не трогает и
+    от раскладки не зависит. Своё же нажатие демон по-прежнему узнаёт по окну
+    `_synthetic_until` — тому всё равно, чем нажатие отправлено.
+    """
+    _key(vk, True)
+    _key(vk, False)
+
+
+def release_modifiers():
+    """Отпустить модификаторы, иначе наш Ctrl+V уедет в приложение как Ctrl+Alt+V."""
+    for vk in MODIFIER_VKS:
+        _key(vk, False)
+
+
+def paste_shortcut():
+    """Ctrl+V — единственное, чем текст попадает в чужое поле ввода."""
+    _key(VK_CONTROL, True)
+    tap(VK_V)
+    _key(VK_CONTROL, False)
+
+
 def paste_text(text, cfg, target=None):
     """
     Вставка в то окно, из которого начали диктовать.
@@ -224,11 +325,7 @@ def paste_text(text, cfg, target=None):
     # Пользователь ещё может удерживать модификаторы хоткея — иначе Ctrl+Alt+V
     # уедет в приложение как другое сочетание.
     time.sleep(0.25)
-    for mod in ("ctrl", "alt", "shift", "windows"):
-        try:
-            keyboard.release(mod)
-        except Exception:  # noqa: BLE001
-            pass
+    release_modifiers()
 
     # Сверка ПОСЛЕ паузы, а не до: четверть секунды — тоже время, за которое
     # успевает сработать Alt+Tab.
@@ -236,7 +333,7 @@ def paste_text(text, cfg, target=None):
     if moved:
         return f"фокус ушёл в «{moved}» — текст в буфере, нажмите Ctrl+V", "lost"
 
-    keyboard.send("ctrl+v")
+    paste_shortcut()
 
     # И ещё раз — уже после нажатия. Окно могло смениться в тот же миг; тогда
     # текст, возможно, не дошёл, и затирать им буфер нельзя.
@@ -261,8 +358,6 @@ def paste_text(text, cfg, target=None):
 # требование «скрытых записей быть не должно» держалось бы только для хоткея,
 # а /voice и ask.py писали бы молча.
 
-VK_CAPITAL = 0x14
-
 
 def capslock_on():
     """Младший бит GetKeyState у переключателей — это состояние «залипания», не нажатие."""
@@ -285,6 +380,9 @@ class Daemon:
         self._synthetic_until = 0.0  # окно, в котором нажатие CapsLock — наше собственное
         self._lamp_lock = threading.Lock()  # set_lamp зовут два потока: сессия и сторож
         self._lamp_misses = 0  # сколько раз подряд лампа не поддалась
+        self._events_seen = time.time()  # когда события клавиатуры доходили до нас
+        self._dead_signs = 0  # сколько раз подряд похоже, что перехват отвалился
+        self.respawn = False  # уходим, чтобы подняться заново (см. recover_hotkeys)
         self.tray = None
 
     # -- обработчики хоткеев (выполняются в потоке хука: только флаги!) ------ #
@@ -304,6 +402,16 @@ class Daemon:
             beep(self.cfg, "error")
             return
         self.toggle.set()
+
+    def note_event(self, _event=None):
+        """
+        Отметка «события клавиатуры до обработчиков доходят».
+
+        Ставится на общий хук: какая именно клавиша — не важно, важен сам факт,
+        что цепочка библиотеки жива. Отсюда и требование к методу: он выполняется
+        на каждое нажатие человека и обязан быть мгновенным.
+        """
+        self._events_seen = time.time()
 
     def on_cancel(self):
         self.cancel.set()
@@ -373,6 +481,8 @@ class Daemon:
         hotkey = self.cfg["hotkey"]
         cancel_key = self.cfg.get("cancel_hotkey", "alt+x")
         quit_key = self.cfg.get("quit_hotkey", "ctrl+alt+q")
+        self._events_seen = time.time()
+        keyboard.hook(self.note_event)  # только отметка живости, до всех хоткеев
         keyboard.add_hotkey(hotkey, self.on_toggle)
         keyboard.add_hotkey(cancel_key, self.on_cancel)
         keyboard.add_hotkey(quit_key, self.on_quit)
@@ -500,7 +610,7 @@ class Daemon:
                 return
             self._synthetic_until = time.time() + 0.5
             try:
-                keyboard.send("caps lock")
+                tap(VK_CAPITAL)
             except Exception as e:  # noqa: BLE001 — лампочка не повод ронять запись
                 self._synthetic_until = 0.0
                 log(f"[warn] не удалось переключить CapsLock: {e}")
@@ -539,12 +649,81 @@ class Daemon:
         if capslock_on() == self.recording:
             self._lamp_misses = 0
             return
+        if self.hotkeys_look_dead():
+            self.recover_hotkeys()
+            return
         if self._lamp_misses >= self.LAMP_MAX_MISSES:
             return
         self._lamp_misses += 1
         log(f"[info] лампочка разошлась с записью — выравниваю "
             f"(попытка {self._lamp_misses})")
         self.set_lamp(self.recording)
+
+    # Сколько молчания обработчиков считать отказом перехвата. Нажатие, из-за
+    # которого лампочка разошлась с записью, обязано было прийти и обновить
+    # отметку; три секунды — запас на медленную очередь событий.
+    EVENTS_SILENCE_SEC = 3.0
+    # Подтверждений подряд, прежде чем перезапускаться. Одного мало: в момент
+    # старта записи состояния расходятся законно, на доли секунды.
+    DEAD_SIGNS_TO_ACT = 2
+
+    def hotkeys_look_dead(self):
+        """
+        Отличить «перехват клавиш отвалился» от обычного рассинхрона лампочки.
+
+        Признак один и он надёжный: лампочка разошлась с записью — значит клавишу
+        только что нажали, Windows зажигает её сама, — а до обработчиков за
+        последние секунды не дошло ни одного события. Живой перехват доставил бы
+        как минимум это самое нажатие.
+
+        Занятость исключаем отдельно: пока идёт распознавание, нажатия отвергаем
+        мы сами, и перехват тут не при чём.
+        """
+        if self.busy:
+            return False
+        if time.time() - self._events_seen < self.EVENTS_SILENCE_SEC:
+            self._dead_signs = 0
+            return False
+        self._dead_signs += 1
+        return self._dead_signs >= self.DEAD_SIGNS_TO_ACT
+
+    def recover_hotkeys(self):
+        """
+        Перехват клавиш потерян — уйти и подняться заново.
+
+        Сторож `keepalive.py` этот случай не ловит принципиально: он спрашивает
+        демона по сокету, а демон жив и отвечает бодрым «ok». Мёртв только путь
+        от клавиатуры к обработчикам, и увидеть это можно лишь изнутри.
+
+        Почему перезапуск процесса, а не переустановка перехватчика на месте:
+        библиотека keyboard ставит системный хук один раз, в потоке, который
+        навсегда остаётся в GetMessage, и её открытым интерфейсом снять или
+        переставить его нельзя. Лезть во внутренности — привязка к версии
+        библиотеки; свежий процесс чинит то же самое и заодно всё остальное, что
+        могло затечь за дни непрерывной работы. Всё состояние демона лежит в
+        файлах, терять при этом нечего.
+
+        Файл-выключатель НЕ трогаем: это не отказ человека от инструмента, а
+        починка, и сторож обязан продолжать следить.
+
+        Если идёт запись — сначала останавливаем её так, будто нажали «стоп»:
+        человек ведь и нажал, просто нажатие до нас не дошло. Распознавание и
+        вставка успеют пройти целиком — выход проверяется только между записями,
+        поэтому диктовка не теряется.
+        """
+        if self.respawn:
+            return  # перезапуск уже запрошен, второй раз шуметь не надо
+        self.respawn = True
+        log("[error] перехват клавиш потерян — CapsLock до демона не доходит; "
+            "перезапускаю демон")
+        write_status("перехват клавиш потерян, перезапуск демона")
+        # Звук — из отдельного потока: winsound.Beep блокирует на всё время
+        # сигнала, а сторож лампочки должен продолжать тикать.
+        threading.Thread(target=lambda: beep(self.cfg, "error"), daemon=True).start()
+        if self.recording:
+            log("[warn] запись останавливаю сама: нажатие «стоп» до демона не дошло")
+        self.quit.set()
+        self.toggle.set()  # разбудить главный цикл, он стоит на toggle.wait
 
     def flash(self, phase, note=None, seconds=1.6):
         """
@@ -709,6 +888,8 @@ def main():
                          "(так тесты управляют записью, не трогая клавиатуру)")
     ap.add_argument("--last", action="store_true",
                     help="вернуть последнюю расшифровку в буфер обмена")
+    ap.add_argument("--restarted", action="store_true",
+                    help="служебный: демон поднят автоперезапуском, ждёт освобождения порта")
     args = ap.parse_args()
 
     if args.last:
@@ -755,26 +936,32 @@ def main():
         except OSError as e:
             log(f"[warn] не удалось убрать {OFF_FILE.name}: {e}")
 
-    lock = ensure_single_instance()
+    lock = ensure_single_instance(wait_sec=15.0 if args.restarted else 0.0)
     if lock is None:
         log(f"[error] демон уже запущен (порт {CONTROL_PORT} занят). "
             f"Второй экземпляр не нужен.")
         return 1
+    if args.restarted:
+        log("[info] демон поднят автоперезапуском после потери перехвата клавиш")
     # Индикатор — отдельный процесс и переживает демона. Если тот уйдёт, не погасив
     # состояние (Ctrl+C, закрытое окно, падение), капсула останется висеть на экране.
     atexit.register(clear_recording_state)
     install_crash_logging()
+    daemon = Daemon(overrides)
     try:
-        return Daemon(overrides).run(lock)
+        code = daemon.run(lock)
     except KeyboardInterrupt:
         log("\n[info] прервано пользователем")
-        return 0
+        code = 0
     except Exception:  # noqa: BLE001 — иначе выход тихий, см. log_crash
         log_crash("демон упал в главном цикле")
-        return 3
+        code = 3
     finally:
         clear_recording_state()
-        lock.close()
+        lock.close()  # порт отпускаем ДО подъёма следующего демона
+    if daemon.respawn:
+        relaunch()
+    return code
 
 
 if __name__ == "__main__":
