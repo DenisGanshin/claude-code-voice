@@ -29,11 +29,14 @@ BASE = Path(__file__).resolve().parent
 sys.path.insert(0, str(BASE))
 
 from voice_core import (  # noqa: E402
-    SPEECH_ALARM_SCORE,
+    MAX_ZERO_SHARE,
+    MIN_FORMANT_SHARE,
+    MIN_MODULATION_CONTRAST,
     alarm_score,
     audio_report,
     band_block_rms,
     load_config,
+    quiet_reason,
     resample_to_16k,
 )
 
@@ -105,18 +108,21 @@ def main():
             print(f"В {folder} нет записей. Записи хранятся сутки — возможно, срок вышел.")
             return 1
 
-    print(f"{'файл':<30} {'длина':>7} {'речь':>9} {'блоки':>7} {'уровень':>9}  вердикт")
-    print("-" * 92)
+    print(f"{'файл':<30} {'длина':>7} {'речь':>9} {'контр':>7} {'форм':>6} "
+          f"{'нули':>6} {'уровень':>9}  вердикт")
+    print("-" * 110)
     for p in paths:
         if not p.exists():
             print(f"{p.name:<30}  нет такого файла")
             continue
         audio = read_wav(p)
         rep = audio_report(audio, alarm=alarm)
-        verdict = ("ПУСТО — расшифровка будет выдумана" if rep["quiet"]
-                   else "речь есть")
+        # Вердикт словами, а не «ПУСТО»: причины разные и лечатся по-разному —
+        # оборванный поток проверкой устройства, гул тем, чтобы говорить в него.
+        verdict = quiet_reason(rep, alarm) if rep["quiet"] else "речь есть"
         print(f"{p.name:<30} {rep['sec']:6.1f}с {rep['score']:9.5f} "
-              f"{rep['voiced'] * 100:6.0f}% {rep['dbfs']:8.0f}дБ  {verdict}")
+              f"{rep['contrast']:7.1f} {rep['formants']:6.2f} "
+              f"{rep['zeros']:6.2f} {rep['dbfs']:8.0f}дБ  {verdict}")
         print(f"{'':<30} {envelope(audio)}")
         if args.spectrum:
             for lo, hi, name, pct in spectrum(audio):
@@ -124,12 +130,15 @@ def main():
                 print(f"{'':<30} {lo:5d}-{hi:5d} Гц {pct:5.1f}% {bar} {name}")
         print()
 
+    print(f"Вердикт ставится по трём признакам, не зависящим от микрофона: "
+          f"контраст ≥{MIN_MODULATION_CONTRAST} (у речи есть слоги и паузы), "
+          f"форманты ≥{MIN_FORMANT_SHARE} (голос, а не гул из-за стены), "
+          f"нули ≤{MAX_ZERO_SHARE} (поток не оборван).")
     if alarm > 0:
-        print(f"Порог тревоги: {alarm}. Ниже него в записи нет разборчивой речи —")
-        print("проверьте, не выбран ли микрофон, до которого голос не доходит.")
+        print(f"Плюс ваш собственный порог по уровню речи: {alarm}.")
     else:
-        print(f"Тревога о пустой записи выключена (speech_alarm_score: 0). "
-              f"Для справки умолчание — {SPEECH_ALARM_SCORE}.")
+        print("Порога по абсолютному уровню нет (speech_alarm_score не задан) — "
+              "он зависит от чувствительности микрофона и потому не универсален.")
     return 0
 
 
