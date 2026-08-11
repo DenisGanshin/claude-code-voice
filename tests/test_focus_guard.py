@@ -240,6 +240,16 @@ def main():
               f"убрано {removed}")
         check("свежая история не тронута", path.exists())
 
+        # Ноль означает «не убирать», а не «убрать всё»: срок хранения задаётся
+        # человеком, и опечатка в конфиге не должна стирать историю целиком.
+        older = tmp / "2019-01-01.md"
+        older.write_text("совсем древняя", encoding="utf-8")
+        os.utime(older, (time.time() - 400 * 86400,) * 2)
+        check("TTL=0 отключает уборку, а не стирает всё",
+              voice_core.cleanup_transcripts(tmp, 0) == 0 and older.exists(),
+              "файл 400-дневной давности на месте")
+        older.unlink()
+
         voice_core.LAST_TRANSCRIPT = tmp / "_missing.txt"
         check("нет расшифровок — не падаем", voice_core.last_transcript() is None)
 
