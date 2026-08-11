@@ -24,6 +24,7 @@ import voice_core  # noqa: E402  — нужен как модуль: через 
 from voice_core import (  # noqa: E402
     KEYS_FILE,
     Recorder,
+    alarm_score,
     audio_report,
     beep,
     clear_recording_state,
@@ -86,7 +87,7 @@ def main():
         # Метрики считаем и для файла: прогон сохранённой записи должен давать
         # тот же вердикт о её пригодности, что и живая диктовка. Иначе разбор
         # «почему получилась чушь» на файле выглядит иначе, чем в бою.
-        report = audio_report(audio)
+        report = audio_report(audio, alarm=alarm_score(cfg))
         log(f"[info] файл {args.file}: {format_audio_report(report)}")
     else:
         rec = Recorder(cfg)

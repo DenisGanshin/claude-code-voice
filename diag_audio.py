@@ -30,6 +30,7 @@ sys.path.insert(0, str(BASE))
 
 from voice_core import (  # noqa: E402
     SPEECH_ALARM_SCORE,
+    alarm_score,
     audio_report,
     band_block_rms,
     load_config,
@@ -90,10 +91,15 @@ def main():
     ap.add_argument("--spectrum", action="store_true", help="показать профиль по частотам")
     args = ap.parse_args()
 
+    cfg = load_config()
+    # Порог берём из конфигурации, а не из умолчания: вердикт диагностики обязан
+    # совпадать с тем, что решает демон на этой же машине.
+    alarm = alarm_score(cfg)
+
     if args.files:
         paths = [Path(f) for f in args.files]
     else:
-        folder = BASE / load_config().get("recordings_dir", "_recordings")
+        folder = BASE / cfg.get("recordings_dir", "_recordings")
         paths = sorted(folder.glob("*.wav"))
         if not paths:
             print(f"В {folder} нет записей. Записи хранятся сутки — возможно, срок вышел.")
@@ -106,7 +112,7 @@ def main():
             print(f"{p.name:<30}  нет такого файла")
             continue
         audio = read_wav(p)
-        rep = audio_report(audio)
+        rep = audio_report(audio, alarm=alarm)
         verdict = ("ПУСТО — расшифровка будет выдумана" if rep["quiet"]
                    else "речь есть")
         print(f"{p.name:<30} {rep['sec']:6.1f}с {rep['score']:9.5f} "
@@ -118,8 +124,12 @@ def main():
                 print(f"{'':<30} {lo:5d}-{hi:5d} Гц {pct:5.1f}% {bar} {name}")
         print()
 
-    print(f"Порог тревоги: {SPEECH_ALARM_SCORE}. Ниже него в записи нет разборчивой речи —")
-    print("проверьте, не выбран ли микрофон, до которого голос не доходит.")
+    if alarm > 0:
+        print(f"Порог тревоги: {alarm}. Ниже него в записи нет разборчивой речи —")
+        print("проверьте, не выбран ли микрофон, до которого голос не доходит.")
+    else:
+        print(f"Тревога о пустой записи выключена (speech_alarm_score: 0). "
+              f"Для справки умолчание — {SPEECH_ALARM_SCORE}.")
     return 0
 
 

@@ -225,6 +225,31 @@ try:
     voice_core.transcribe = lambda *a, **k: "Продолжение следует..."
     final_h, _r, note_h = process_audio(near, cfg, ["key"], report=audio_report(near))
     check("галлюцинация из списка по-прежнему отбрасывается", final_h is None, note_h)
+
+    # Порог подстраивается под железо. Умолчание откалибровано по конкретным
+    # микрофонам, а тихий встроенный отдаёт на нормальной речи 0.0055-0.0078
+    # (замер 11.08) — то есть ниже умолчания, и пометку получает КАЖДАЯ диктовка.
+    # Пометка, которая стоит всегда, не значит ничего.
+    voice_core.transcribe = lambda *a, **k: "Добро пожаловать в Казахстан!"
+    check("порог берётся из конфигурации",
+          voice_core.alarm_score({"speech_alarm_score": 0.004}) == 0.004)
+    check("без ключа остаётся умолчание",
+          voice_core.alarm_score({}) == voice_core.SPEECH_ALARM_SCORE)
+    check("мусор в ключе не ломает запись, а откатывается к умолчанию",
+          voice_core.alarm_score({"speech_alarm_score": "низко"})
+          == voice_core.SPEECH_ALARM_SCORE)
+    check("ноль выключает тревогу: пустая запись больше не помечается",
+          audio_report(quiet, alarm=0)["quiet"] is False,
+          "и пустой вход тоже: " + str(audio_report(None, alarm=0)["quiet"]))
+    check("ноль выключает тревогу и для пустого входа",
+          audio_report(None, alarm=0)["quiet"] is False)
+    final_off, _r, note_off = process_audio(quiet, cfg, ["key"],
+                                            report=audio_report(quiet, alarm=0))
+    check("с выключенной тревогой текст идёт без пометки",
+          bool(final_off) and not final_off.startswith(QUIET_RECORDING_MARK),
+          f"«{(final_off or '')[:40]}»")
+    check("выключенная тревога не оставляет следа и в статусе",
+          "почти пустая" not in note_off, note_off)
 finally:
     voice_core.transcribe, voice_core.normalize = _orig_transcribe, _orig_normalize
 
