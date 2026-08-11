@@ -15,7 +15,7 @@
   F. окно старта неизвестно -> ведём себя как раньше;
   G. расшифровки: пишутся, читаются, чистятся по сроку.
 
-Ни живой клавиатуры, ни живого буфера обмена: `keyboard.send` и `pyperclip`
+Ни живой клавиатуры, ни живого буфера обмена: `paste_shortcut` и `pyperclip`
 подменены. Настоящее нажатие Ctrl+V уехало бы в окно человека, сидящего за этой
 же машиной, а настоящий `copy` затёр бы то, что он держит в буфере.
 
@@ -28,6 +28,7 @@
 
 import ctypes
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -69,10 +70,10 @@ class FakeKeyboard:
     def __init__(self):
         self.sent = []
 
-    def send(self, combo):
-        self.sent.append(combo)
+    def paste_shortcut(self):
+        self.sent.append("ctrl+v")
 
-    def release(self, key):
+    def release_modifiers(self):
         pass
 
 
@@ -97,18 +98,19 @@ def run_paste(text, cfg, target, focus_sequence, clipboard_initial="__БЫЛО__
     def fake_foreground():
         return seq.pop(0) if len(seq) > 1 else seq[0]
 
-    saved = (voice_hotkey.pyperclip, voice_hotkey.keyboard,
-             voice_hotkey.foreground_window)
+    saved = (voice_hotkey.pyperclip, voice_hotkey.paste_shortcut,
+             voice_hotkey.release_modifiers, voice_hotkey.foreground_window)
     voice_hotkey.pyperclip = clip
-    voice_hotkey.keyboard = kbd
+    voice_hotkey.paste_shortcut = kbd.paste_shortcut
+    voice_hotkey.release_modifiers = kbd.release_modifiers
     voice_hotkey.foreground_window = fake_foreground
     try:
         where, outcome = voice_hotkey.paste_text(text, cfg, target)
         if settle:
             time.sleep(settle)
     finally:
-        (voice_hotkey.pyperclip, voice_hotkey.keyboard,
-         voice_hotkey.foreground_window) = saved
+        (voice_hotkey.pyperclip, voice_hotkey.paste_shortcut,
+         voice_hotkey.release_modifiers, voice_hotkey.foreground_window) = saved
     return where, outcome, clip, kbd
 
 
@@ -248,6 +250,10 @@ def main():
 
     # -- H. подставной источник отличим от настоящей записи ------------------ #
     check_fake_indicator()
+
+    # За собой убираем целиком: остатки в _test_tmp ронял следующий тест, который
+    # ту же папку удаляет как свою.
+    shutil.rmtree(BASE / "_test_tmp", ignore_errors=True)
 
     passed = sum(1 for _, ok, _ in results if ok)
     print("\n" + "=" * 60)
