@@ -35,6 +35,7 @@ from voice_core import (  # noqa: E402
     process_audio,
     resample_to_16k,
     save_recording,
+    save_transcript,
     set_recording_state,
     write_status,
 )
@@ -138,6 +139,13 @@ def main():
 
     log(f"[info] статус: {note}")
     write_status(f"готово: {len(final)} симв. ({note})")
+    # В историю — как и диктовки хоткеем: `/voice` теряет текст иначе, но теряет.
+    # Claude мог не дочитать вывод, сессия — оборваться, а надиктованное на пять
+    # минут существует к этому моменту только в stdout уже закончившегося процесса.
+    # `--file` не пишем: эта расшифровка в истории уже есть, от той записи, и
+    # повторный разбор архива плодил бы дубли.
+    if recorded:
+        save_transcript(final, cfg, source="/voice")
     done()
     if args.show_raw and raw != final:
         log(f"[raw] {raw}")
