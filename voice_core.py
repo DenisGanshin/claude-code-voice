@@ -789,11 +789,29 @@ def trim_silence(audio, sr=SAMPLE_RATE, pad_sec=0.3):
     return np.asarray(audio[lo:hi])
 
 
-def audio_report(audio, sr=SAMPLE_RATE):
+def alarm_score(cfg):
+    """
+    Порог, ниже которого запись считается пустой, — с поправкой на железо.
+
+    Он откалиброван по конкретным микрофонам, а такая калибровка не переносится:
+    тихий встроенный микрофон отдаёт на нормальной, разборчивой речи 0.0055-0.0078
+    (замер 11.08, уровень −38 dBFS) — то есть ниже умолчания, и тогда КАЖДАЯ
+    диктовка помечается как выдуманная. Пометка, которая стоит всегда, не значит
+    ничего и только мешает: её начинают пролистывать вместе с настоящими.
+
+    Ноль отключает тревогу целиком — для тех, кто предпочитает не иметь её вовсе.
+    """
+    try:
+        return max(0.0, float(cfg.get("speech_alarm_score", SPEECH_ALARM_SCORE)))
+    except (TypeError, ValueError):
+        return SPEECH_ALARM_SCORE
+
+
+def audio_report(audio, sr=SAMPLE_RATE, alarm=SPEECH_ALARM_SCORE):
     """Метрики записи одной строкой — то, чего не хватало в логе 07.08."""
     if audio is None or len(audio) == 0:
         return {"sec": 0.0, "rms": 0.0, "dbfs": -999.0, "peak": 0.0,
-                "score": 0.0, "voiced": 0.0, "quiet": True}
+                "score": 0.0, "voiced": 0.0, "quiet": alarm > 0}
     a = np.asarray(audio, dtype=np.float64)
     rms = float(np.sqrt(np.mean(a * a)))
     score, voiced = speech_score(a, sr)
@@ -804,7 +822,7 @@ def audio_report(audio, sr=SAMPLE_RATE):
         "peak": float(np.max(np.abs(a))),
         "score": score,
         "voiced": voiced,
-        "quiet": score < SPEECH_ALARM_SCORE,
+        "quiet": alarm > 0 and score < alarm,
     }
 
 
@@ -1561,10 +1579,11 @@ class Recorder:
         if not candidates:
             return None
 
+        alarm = alarm_score(self.cfg)
         scored = []
         for name, a in candidates:
             trimmed = trim_silence(a)
-            rep = audio_report(trimmed)
+            rep = audio_report(trimmed, alarm=alarm)
             scored.append((rep["score"], name, trimmed, rep))
         scored.sort(key=lambda t: -t[0])
 
@@ -1585,7 +1604,7 @@ class Recorder:
 
         if best_rep["quiet"]:
             log(f"[warn] РЕЧИ ПОЧТИ НЕТ (речь={best_score:.5f} при пороге "
-                f"{SPEECH_ALARM_SCORE}). Расшифровка такой записи ненадёжна: "
+                f"{alarm}). Расшифровка такой записи ненадёжна: "
                 f"модель домысливает текст на тишине.")
         return best_audio
 

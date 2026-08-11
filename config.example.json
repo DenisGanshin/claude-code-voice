@@ -35,6 +35,7 @@
   "vad_release": 0.55,
   "vad_speech_cap": 0.35,
   "speech_onset_blocks": 2,
+  "speech_alarm_score": 0.008,
   "noise_window_sec": 4.0,
   "noise_percentile": 15,
   "noise_rise_rate": 0.05,
