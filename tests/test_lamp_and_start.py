@@ -15,15 +15,20 @@
 моделью того, как ведёт себя система. Настоящее синтетическое нажатие переключило
 бы регистр человеку, который в этот момент работает за той же машиной.
 
-Запуск:  python tests/test_lamp_and_start.py
+Запуск:  python tests/test_lamp_and_start.py            (с замером на микрофоне)
+         python tests/test_lamp_and_start.py --no-mic  (без единого обращения к нему)
 """
 
 import shutil
+import socket
 import sys
+import threading
 import time
 import wave
 from pathlib import Path
+from types import SimpleNamespace
 
+import keyboard
 import numpy as np
 
 BASE = Path(__file__).resolve().parent.parent
@@ -63,30 +68,42 @@ class FakeKeyboard:
 
     `dead=True` — лампа не поддаётся (система нажатие принимает, состояние не
     меняет): так проверяется предел попыток сторожа.
+
+    Хуков два, и это не удвоение одного и того же. Библиотека зовёт общий хук по
+    коду клавиши, а хоткей — по кортежу всех нажатых сейчас клавиш, и отказать они
+    могут порознь: ровно так инструмент встал 15–16.08 (события шли, CapsLock
+    молчал). Модель с одним хуком этот отказ выразить не может в принципе.
     """
 
     def __init__(self, caps=False, dead=False):
         self.caps = caps
         self.dead = dead
         self.presses = 0
-        self.hook = None  # обработчик демона, как настоящий keyboard.add_hotkey
+        self.hook = None  # обработчик хоткея, как настоящий keyboard.add_hotkey
+        self.general = None  # общий хук, как keyboard.hook: отметка живости событий
 
     def press(self, key="caps lock"):
-        """Нажатие: сперва система меняет состояние, потом событие идёт в хук."""
+        """Нажатие: сперва система меняет состояние, потом событие идёт в хуки."""
         self.presses += 1
         if not self.dead:
             self.caps = not self.caps
+        if self.general:
+            self.general()
         if self.hook:
             self.hook()
 
 
-def make_daemon(fake, recording=False, busy=False, hook_alive=True):
+def make_daemon(fake, recording=False, busy=False, hook_alive=True,
+                hotkey_alive=True):
     """
     Демон с подменённой клавиатурой и без звуков.
 
-    `hook_alive=False` — перехват клавиш отвалился: система нажатия принимает и
-    лампочку переключает, а до обработчиков демона они не доходят вовсе. Именно
-    так инструмент вставал 10.08.
+    `hook_alive=False` — перехват клавиш отвалился целиком: система нажатия
+    принимает и лампочку переключает, а до демона они не доходят вовсе. Именно так
+    инструмент вставал 10.08.
+
+    `hotkey_alive=False` — доставка расслоилась: общий хук события получает (демон
+    считает перехват живым), а обработчик хоткея не зовётся. Отказ 15–16.08.
     """
     voice_hotkey.capslock_on = lambda: fake.caps
     # Подменяется именно `tap`: демон жмёт клавиши через keybd_event, а не через
@@ -95,7 +112,8 @@ def make_daemon(fake, recording=False, busy=False, hook_alive=True):
     d = voice_hotkey.Daemon({"beep": False, "show_overlay": False})
     d.recording = recording
     d.busy = busy
-    fake.hook = d.on_toggle if hook_alive else None
+    fake.general = d.note_event if hook_alive else None
+    fake.hook = d.on_toggle if (hook_alive and hotkey_alive) else None
     return d
 
 
@@ -226,6 +244,142 @@ def run_hook_recovery_tests():
 
 
 # --------------------------------------------------------------------------- #
+# E. Доставка хоткея: события идут, а CapsLock не работает
+# --------------------------------------------------------------------------- #
+
+def put_ghost(name="left alt", code=56):
+    """Подложить призрака в таблицу нажатых клавиш библиотеки."""
+    keyboard._pressed_events.clear()
+    keyboard._pressed_events[code] = SimpleNamespace(name=name, scan_code=code)
+
+
+def expire_probe(d, seconds=2.0):
+    """
+    Отмотать время назад, не досиживая пробу вживую.
+
+    Двигаем только время пробы: вернулась она или нет — отдельный флаг, который
+    ставит и снимает сам обработчик. Отматывать здесь ещё и его значило бы решать
+    за предмет проверки, чем всё кончилось.
+    """
+    d._probe_at -= seconds
+    d._synthetic_until = 0.0
+
+
+def run_hotkey_delivery_tests():
+    """
+    Жалоба 16.08: «жму капс, ничего не запускается» — вторые сутки подряд.
+
+    Демон был жив и отвечал по сокету, общий хук события получал (поэтому
+    самопроверка 10.08 молчала: она смотрит именно на события), а обработчик
+    хоткея не звался. В логе — только «лампочка разошлась с записью»: Windows
+    зажигала капс от нажатия, сторож исправно гасил, и на этом всё.
+
+    Датчик здесь активный: сторож нажимает CapsLock сам и ждёт своё же нажатие
+    обратно в обработчике. Спрашивать человека «нажми ещё раз» не нужно.
+    """
+    print("\n--- E. Доставка хоткея ---")
+
+    # Норма: своё нажатие вернулось в обработчик — подозрений нет.
+    fake = FakeKeyboard(caps=True)
+    d = make_daemon(fake, recording=False)
+    d.set_lamp(False)
+    check("проба вернулась в обработчик — датчик молчит",
+          d.hotkey_undelivered() is False and d._probe_pending is False,
+          "нажатие сторожа прошло весь путь")
+
+    # Отказ: общий хук жив (события идут), хоткей молчит. Прежний детектор такое
+    # пропускает — он судит по событиям, а они в порядке.
+    fake = FakeKeyboard(caps=True)
+    d = make_daemon(fake, recording=False, hotkey_alive=False)
+    d.set_lamp(False)
+    check("прежний детектор этот отказ не видит",
+          d.hotkeys_look_dead() is False, "события свежие, перехват «жив»")
+    expire_probe(d)
+    check("проба не вернулась — датчик поднимает тревогу",
+          d.hotkey_undelivered() is True)
+
+    # Лечение первой ступени: снять призраков, демон не перезапускается.
+    put_ghost()
+    fake = FakeKeyboard(caps=True)
+    d = make_daemon(fake, recording=False, hotkey_alive=False)
+    d.set_lamp(False)
+    expire_probe(d)
+    d.lamp_tick()
+    check("залипшие клавиши сняты", not keyboard._pressed_events,
+          "таблица нажатых пуста")
+    check("первая ступень — чистка, а не перезапуск",
+          d.respawn is False and d._unstick_tries == 1)
+
+    # Вторая ступень: чистка не помогла — перезапуск, как при потере перехвата.
+    d.set_lamp(True)  # новое расхождение → новая проба
+    expire_probe(d)
+    d.lamp_tick()
+    check("чистка не помогла — демон перезапускается",
+          d.respawn is True and d.quit.is_set())
+
+    # Занят распознаванием: нажатия отвергаем мы сами, доставка ни при чём.
+    fake = FakeKeyboard(caps=True)
+    d = make_daemon(fake, recording=False, hotkey_alive=False)
+    d.set_lamp(False)
+    expire_probe(d)
+    d.busy = True
+    check("занят распознаванием — это не отказ доставки",
+          d.hotkey_undelivered() is False)
+
+    # Команда по сокету идёт мимо клавиатуры и доказательством быть не может:
+    # иначе `--send toggle` из теста или скрипта снимал бы тревогу вместо лечения.
+    fake = FakeKeyboard(caps=True)
+    d = make_daemon(fake, recording=False, hotkey_alive=False)
+    d.set_lamp(False)
+    expire_probe(d)
+    d.on_toggle(via_keyboard=False)
+    check("команда по сокету не считается доказательством живой доставки",
+          d.hotkey_undelivered() is True)
+
+    # Тот же вопрос, но через настоящий канал управления, а не прямым вызовом:
+    # различие «с клавиатуры / по сокету» живёт в реестре команд `serve_control`,
+    # и проверка, минующая реестр, зелена даже если там забыли передать флаг.
+    fake = FakeKeyboard(caps=True)
+    d = make_daemon(fake, recording=False, hotkey_alive=False)
+    d.set_lamp(False)
+    expire_probe(d)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))  # любой свободный порт: рабочий демон не трогаем
+    sock.listen(1)
+    threading.Thread(target=d.serve_control, args=(sock,), daemon=True).start()
+    try:
+        with socket.create_connection(sock.getsockname(), timeout=3) as c:
+            c.sendall(b"toggle\n")
+            c.recv(16)
+        check("«toggle» по сокету доходит до демона", d.toggle.is_set())
+        check("но живой доставкой с клавиатуры не притворяется",
+              d.hotkey_undelivered() is True)
+    finally:
+        d.quit.set()
+        sock.close()
+
+    # Зеркальная проверка: настоящее нажатие тревогу снимает.
+    fake = FakeKeyboard(caps=True)
+    d = make_daemon(fake, recording=False)
+    d.set_lamp(False)
+    expire_probe(d)
+    fake.press()
+    check("нажатие с клавиатуры тревогу снимает",
+          d.hotkey_undelivered() is False)
+
+    # Без пробы судить не о чем: молчащий обработчик при отсутствии нажатий —
+    # это просто тишина, а не отказ.
+    fake = FakeKeyboard(caps=False)
+    d = make_daemon(fake, recording=False)
+    for _ in range(3):
+        d.lamp_tick()
+    check("пробы не было — тревоги нет", d.respawn is False and d._unstick_tries == 0,
+          "час без нажатий — нормальная работа")
+
+    keyboard._pressed_events.clear()  # за собой: таблица общая на процесс
+
+
+# --------------------------------------------------------------------------- #
 # B. Старт записи: быстрее и без потери начала фразы
 # --------------------------------------------------------------------------- #
 
@@ -237,7 +391,7 @@ def write_wav(path, samples, sr=16000):
         w.writeframes((np.clip(samples, -1, 1) * 32767).astype(np.int16).tobytes())
 
 
-def run_start_tests(tmp):
+def run_start_tests(tmp, live_mic=True):
     print("\n--- B. Старт записи ---")
 
     # Профиль разгона моделирует сам подставной микрофон: он подмешивает 0.5 с
@@ -292,6 +446,14 @@ def run_start_tests(tmp):
 
     # Замер на живом устройстве — он и был предметом жалобы. Порог с запасом:
     # это защита от возврата к 1.3 с, а не обещание конкретных миллисекунд.
+    #
+    # Единственное место файла, открывающее ЖИВОЙ микрофон. Под флагом, потому что
+    # остальные проверки к устройству не прикасаются, а спрашивать разрешение на
+    # запись ради них — значит либо дёргать человека, либо (хуже) открывать
+    # микрофон молча: и то и другое уже случалось 11.08.
+    if not live_mic:
+        print("[skip] старт на живом микрофоне — пропущен по --no-mic")
+        return
     budget = 1.1
     try:
         real = voice_core.Recorder(voice_core.load_config())
@@ -331,13 +493,15 @@ def run_log_tests():
     check("в тихом режиме файл всё равно наполняется", quiet_marker in tail)
 
 
-def main():
+def main(argv=None):
+    live_mic = "--no-mic" not in (argv if argv is not None else sys.argv[1:])
     tmp = BASE / "_test_tmp"
     tmp.mkdir(exist_ok=True)
     try:
         run_lamp_tests()
         run_hook_recovery_tests()
-        run_start_tests(tmp)
+        run_hotkey_delivery_tests()
+        run_start_tests(tmp, live_mic=live_mic)
         run_log_tests()
     finally:
         # Целиком, а не по маске: в этой же папке оставляет свои файлы
