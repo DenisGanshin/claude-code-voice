@@ -298,11 +298,22 @@ def run_hotkey_delivery_tests():
     check("проба не вернулась — датчик поднимает тревогу",
           d.hotkey_undelivered() is True)
 
-    # Лечение первой ступени: снять призраков, демон не перезапускается.
+    # Одиночный промах не лечится: на живой системе он бывает и без поломки —
+    # человек держит другую клавишу, кортеж хоткея не совпадает, проба честно не
+    # возвращается. 16.08 такая тревога пришла при ПУСТОЙ таблице нажатых.
     put_ghost()
     fake = FakeKeyboard(caps=True)
     d = make_daemon(fake, recording=False, hotkey_alive=False)
     d.set_lamp(False)
+    expire_probe(d)
+    d.lamp_tick()
+    check("одна непришедшая проба — только отметка, без лечения",
+          d._probe_misses == 1 and d._unstick_tries == 0
+          and bool(keyboard._pressed_events) and d.respawn is False,
+          "таблица не тронута, перезапуска нет")
+
+    # Лечение первой ступени: подтвердилось второй пробой — снять призраков.
+    d.set_lamp(True)  # новое расхождение → новая проба
     expire_probe(d)
     d.lamp_tick()
     check("залипшие клавиши сняты", not keyboard._pressed_events,
@@ -311,11 +322,26 @@ def run_hotkey_delivery_tests():
           d.respawn is False and d._unstick_tries == 1)
 
     # Вторая ступень: чистка не помогла — перезапуск, как при потере перехвата.
-    d.set_lamp(True)  # новое расхождение → новая проба
+    d.set_lamp(False)  # новое расхождение → новая проба
     expire_probe(d)
     d.lamp_tick()
     check("чистка не помогла — демон перезапускается",
           d.respawn is True and d.quit.is_set())
+
+    # Промахи должны идти ПОДРЯД: доставленное нажатие между ними снимает счётчик,
+    # иначе два случайных промаха за день сложились бы в перезапуск на ровном месте.
+    fake = FakeKeyboard(caps=True)
+    d = make_daemon(fake, recording=False, hotkey_alive=False)
+    d.set_lamp(False)
+    expire_probe(d)
+    d.lamp_tick()
+    d.on_toggle()  # нажатие дошло — подозрения сняты
+    d.set_lamp(True)
+    expire_probe(d)
+    d.lamp_tick()
+    check("доставленное нажатие обнуляет счётчик промахов",
+          d._probe_misses == 1 and d._unstick_tries == 0 and d.respawn is False,
+          "два разрозненных промаха лечением не считаются")
 
     # Занят распознаванием: нажатия отвергаем мы сами, доставка ни при чём.
     fake = FakeKeyboard(caps=True)
