@@ -2123,12 +2123,18 @@ def _call_normalizer(messages, model, cfg, keys, max_tokens):
         "temperature": 0.1,
         "max_tokens": max_tokens,
     }
+    # gpt-oss — reasoning-модель: без 'low' она тратит бюджет на размышление и
+    # обрывает ответ до текста (service-notes/groq.md). Замена снятых llama-моделей.
+    if "gpt-oss" in model:
+        body["reasoning_effort"] = "low"
     try:
         res = _groq_post("/chat/completions", keys, json_body=body, timeout=60)
     except RuntimeError as e:
         log(f"[warn] модель {model} недоступна: {e}")
         return None
     out = (res["choices"][0]["message"]["content"] or "").strip()
+    # Размышление иногда просачивается в content — вырезаем, оставляя чистый текст.
+    out = re.sub(r"(?is)<think>.*?</think>", "", out).strip()
     return out.strip('"').strip() or None
 
 
@@ -2146,8 +2152,10 @@ def normalize(text, cfg, keys):
 
     terms = ", ".join(session_terms(cfg))
     system = NORMALIZE_SYSTEM.format(terms=terms)
-    # max_tokens впритык: Groq тарифицирует ЗАПРОШЕННЫЕ токены (service-notes/groq.md)
-    max_tokens = min(2000, max(200, int(len(text) / 2) + 200))
+    # max_tokens впритык: Groq тарифицирует ЗАПРОШЕННЫЕ токены (service-notes/groq.md).
+    # Пол 900: reasoning-модели (gpt-oss) часть бюджета тратят на размышление,
+    # при тесном лимите ответ обрывается до текста.
+    max_tokens = min(2000, max(900, int(len(text) / 2) + 300))
 
     messages = [{"role": "system", "content": system}]
     for shot_in, shot_out in NORMALIZE_SHOTS:
