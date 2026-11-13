@@ -1309,18 +1309,32 @@ class Recorder:
         if not candidates:
             return
 
+        # Свой флаг остановки на каждый запуск дублей. Общий флаг, который
+        # `clear()` сбрасывал при следующей записи, позволял опоздавшему потоку
+        # (гарнитура открывается до 1.5 с) решить, что запись ещё идёт, и добавить
+        # открытый поток уже после `_collect_extra`: он писал звук без конца,
+        # около 230 МБ в час (утечка памяти демона, 13.11).
+        self._extra_stop.set()
+        stop = threading.Event()
+        self._extra_stop = stop
+        cap_sec = max(float(self.cfg.get("max_record_sec", 600)),
+                      float(self.cfg.get("auto_max_record_sec", 0) or 0)) + 5.0
+
         def worker():
             for idx, name in candidates:
-                if self._extra_stop.is_set():
+                if stop.is_set():
                     return
                 src = {"name": name, "index": idx, "chunks": [], "stream": None,
-                       "sr": SAMPLE_RATE, "started": time.time()}
+                       "sr": SAMPLE_RATE, "started": time.time(), "frames": 0}
 
                 def cb(indata, _frames, _t, status, _src=src):
                     # Внутри аудио-потока: только скопировать. Любая тяжёлая
                     # работа здесь роняет звук всей системы.
-                    if status:
-                        pass
+                    # После остановки и сверх потолка записи блоки не копим:
+                    # забытый поток не должен расти бесконечно.
+                    if stop.is_set() or _src["frames"] > _src["sr"] * cap_sec:
+                        return
+                    _src["frames"] += len(indata)
                     _src["chunks"].append(indata[:, 0].copy())
 
                 try:
@@ -1343,11 +1357,23 @@ class Recorder:
                         log(f"[info] дубль «{name}» не открылся ({str(e2)[:50]})")
                         continue
                 src["stream"] = stream
+                # Проверка флага и добавление в список — под одним замком с
+                # `_collect_extra`: либо дубль успел в список и будет собран,
+                # либо запись уже закончена, и поток закрывается здесь же.
                 with self._extra_lock:
-                    self._extra.append(src)
+                    late = stop.is_set()
+                    if not late:
+                        self._extra.append(src)
+                if late:
+                    try:
+                        stream.stop()
+                        stream.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    log(f"[info] дубль «{name}» открылся после конца записи, закрыт")
+                    return
                 log(f"[info] дубль пишет: {name}")
 
-        self._extra_stop.clear()
         self._extra_thread = threading.Thread(target=worker, daemon=True,
                                               name="voice-extra-sources")
         self._extra_thread.start()
@@ -1526,10 +1552,9 @@ class Recorder:
     def _close(self):
         # Дубли гасим здесь же: если запись оборвалась исключением, `_finalize`
         # не вызовется, а открытые потоки останутся жить и держать устройства.
-        if self._extra:
-            for _ in self._collect_extra():
-                pass
-        self._extra_stop.set()
+        # Всегда, а не только при непустом списке: дубль мог ещё открываться,
+        # и флаг остановки должен быть поднят до того, как он попадёт в список.
+        self._collect_extra()
         if self._stream is not None:
             try:
                 self._stream.stop()
